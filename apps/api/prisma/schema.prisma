@@ -1,0 +1,444 @@
+// UlixOps data model. Starting point: docs/SPEC.md section 14.3.
+// Connection URL comes from prisma.config.ts (DATABASE_URL), never from this file.
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum Role {
+  ADMIN
+  DEVELOPER
+  VIEWER
+}
+
+enum Host {
+  WPENGINE
+  OTHER
+}
+
+enum Conn {
+  SSH
+  SFTP
+  FTPS
+  FTP
+}
+
+enum TargetStatus {
+  QUEUED
+  SNAPSHOT
+  STAGING
+  CHECKING
+  DEPLOYING
+  DONE
+  ROLLED_BACK
+  FAILED
+  PAUSED
+}
+
+enum ChallengeKind {
+  TOTP // password accepted, waiting for the authenticator code
+  ENROLL // password accepted, 2FA must be set up before a session exists
+}
+
+model User {
+  id               String              @id @default(cuid())
+  email            String              @unique
+  name             String?
+  role             Role                @default(VIEWER)
+  passwordHash     String? // argon2id; null until the setup link is used
+  twoFactorEnabled Boolean             @default(false)
+  totpSecretEnc    String? // AES-256-GCM (TOTP_ENCRYPTION_KEY), never returned by the API
+  totpLastStep     Int? // last accepted TOTP time step, blocks code replay
+  active           Boolean             @default(true)
+  lastLoginAt      DateTime?
+  createdAt        DateTime            @default(now())
+  sessions         Session[]
+  challenges       AuthChallenge[]
+  setupTokens      SetupToken[]
+  devices          KnownDevice[]
+  passkeys         Passkey[]
+  webauthn         WebAuthnChallenge[]
+}
+
+// Tokens below are stored only as HMAC-SHA256(token, SESSION_SECRET).
+
+model Session {
+  id         String    @id @default(cuid())
+  tokenHash  String    @unique
+  userId     String
+  user       User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  ip         String?
+  userAgent  String?
+  createdAt  DateTime  @default(now())
+  lastSeenAt DateTime  @default(now())
+  expiresAt  DateTime // absolute limit (12 h)
+  revokedAt  DateTime?
+
+  @@index([userId])
+}
+
+model AuthChallenge {
+  id        String        @id @default(cuid())
+  tokenHash String        @unique
+  userId    String
+  user      User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  kind      ChallengeKind
+  attempts  Int           @default(0)
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime      @default(now())
+}
+
+// One-time link for setting a password (first admin from the CLI, invites in step 4).
+model SetupToken {
+  id        String    @id @default(cuid())
+  tokenHash String    @unique
+  userId    String
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+}
+
+model KnownDevice {
+  id          String   @id @default(cuid())
+  userId      String
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  deviceHash  String
+  ip          String?
+  userAgent   String?
+  firstSeenAt DateTime @default(now())
+  lastSeenAt  DateTime @default(now())
+
+  @@unique([userId, deviceHash])
+}
+
+// Security events for admins (new-device logins, lockouts). Delivery by email/Slack: step 11.
+model SecurityAlert {
+  id         String    @id @default(cuid())
+  kind       String // NEW_DEVICE_LOGIN | ACCOUNT_LOCKED
+  userId     String?
+  ip         String?
+  userAgent  String?
+  meta       Json?
+  notifiedAt DateTime?
+  createdAt  DateTime  @default(now())
+
+  @@index([createdAt])
+}
+
+// In-app alert centre rows (Build Order step 11, spec §6.8 / screen 19). One row per recipient.
+model Notification {
+  id        String    @id @default(cuid())
+  kind      String // NotificationEvent in shared
+  title     String
+  body      String
+  severity  String // info | warning | critical
+  userId    String
+  siteIds   String[]
+  meta      Json?
+  readAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  @@index([userId, createdAt])
+  @@index([userId, readAt])
+}
+
+model Site {
+  id           String             @id @default(cuid())
+  name         String
+  url          String             @unique // production URL
+  host         Host
+  tags         String[]
+  archived     Boolean            @default(false)
+  createdAt    DateTime           @default(now())
+  updatedAt    DateTime           @default(now()) @updatedAt
+  environments SiteEnvironment[]
+  targets      DeploymentTarget[]
+  backups      Backup[]
+}
+
+enum EnvKind {
+  PRODUCTION
+  STAGING
+}
+
+// How to reach one WordPress install of a site (agent decision A47). No secrets: the SSH key
+// lives in the vault and is referenced by name.
+model SiteEnvironment {
+  id            String    @id @default(cuid())
+  siteId        String
+  site          Site      @relation(fields: [siteId], references: [id], onDelete: Cascade)
+  kind          EnvKind
+  url           String
+  connection    Conn      @default(SSH)
+  sshHost       String
+  sshPort       Int       @default(22)
+  sshUser       String
+  wpPath        String
+  credentialRef String // vault secret name, never the secret
+  hostKey       String? // pinned SSH host key fingerprint, set by the first successful test
+  lastTestAt    DateTime?
+  lastTestOk    Boolean?
+  lastTestError String?
+  wpVersion     String?
+  phpVersion    String?
+  wpCliVersion  String?
+  // Last health check (Build Order step 9, spec §6.6).
+  lastHealthAt      DateTime?
+  lastHealthOk      Boolean?
+  lastHealthSummary String?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @default(now()) @updatedAt
+  inventory     SiteInventory?
+  jobs          SiteJob[]
+  lock          SiteEnvironmentLock?
+  backups       Backup[]
+  deployTargets DeploymentTarget[]
+
+  @@unique([siteId, kind])
+}
+
+// Spec section 7 "SiteSnapshot": the environment's inventory read over WP-CLI, refreshed on
+// demand. Named SiteInventory so it isn't confused with quick snapshots (agent decision A56).
+// One row per environment, replaced on every refresh.
+model SiteInventory {
+  id            String          @id @default(cuid())
+  environmentId String          @unique
+  environment   SiteEnvironment @relation(fields: [environmentId], references: [id], onDelete: Cascade)
+  refreshedAt   DateTime
+  refreshedById String?
+  wpVersion     String
+  phpVersion    String
+  wpCliVersion  String
+  activeTheme   String?
+  maintenance   Boolean?
+  safeMode      Boolean         @default(false)
+  warnings      String[]
+  plugins       Json // InventoryItem[] (packages/shared), validated on read
+  themes        Json // InventoryItem[]
+}
+
+// "One command at a time" per environment (agent decision A60). The primary key makes the
+// claim atomic: a second concurrent claim fails to insert. A lock older than SITE_JOB_STALE_MS
+// (the API stopped mid-job) is taken over with a conditional update, so it can't block forever.
+model SiteEnvironmentLock {
+  environmentId String          @id
+  environment   SiteEnvironment @relation(fields: [environmentId], references: [id], onDelete: Cascade)
+  token         String // random per claim; only its holder releases it
+  lockedAt      DateTime
+}
+
+enum SiteJobStatus {
+  RUNNING
+  SUCCEEDED
+  FAILED
+}
+
+// Job log for remote work on one environment (spec screen 5 "Logs: job logs"): what ran, who
+// asked, the result and the command output as the runner returned it, already redacted.
+model SiteJob {
+  id            String          @id @default(cuid())
+  siteId        String
+  environmentId String
+  environment   SiteEnvironment @relation(fields: [environmentId], references: [id], onDelete: Cascade)
+  action        String // inventory.refresh | plugin.activate | plugin.deactivate | maintenance | cache.flush
+  params        Json
+  status        SiteJobStatus   @default(RUNNING)
+  exitCode      Int?
+  output        String          @default("")
+  requestedById String?
+  startedAt     DateTime
+  finishedAt    DateTime?
+
+  @@index([siteId, startedAt])
+  @@index([environmentId, status])
+}
+
+// Ulix Digital's own plugins (spec 6.3). The slug is the plugin's folder name, which is also
+// how WP-CLI names it in each site's inventory, so installed versions are tracked by slug.
+model Plugin {
+  id        String          @id @default(cuid())
+  slug      String          @unique
+  name      String // from the latest upload's "Plugin Name:" header
+  createdAt DateTime        @default(now())
+  versions  PluginVersion[]
+}
+
+model PluginVersion {
+  id           String       @id @default(cuid())
+  pluginId     String
+  plugin       Plugin       @relation(fields: [pluginId], references: [id])
+  version      String // from the ZIP's "Version:" header
+  sha256       String
+  storageKey   String // path inside PLUGIN_STORE_DIR, e.g. versions/<sha256>.zip
+  sizeBytes    Int
+  changelog    String
+  dbChanging   Boolean      @default(false)
+  requiresWp   String?
+  requiresPhp  String?
+  uploadedById String?
+  createdAt    DateTime     @default(now())
+  deployments  Deployment[]
+
+  @@unique([pluginId, version])
+}
+
+// A ZIP that passed every check and waits, quarantined, for its changelog (agent decision A63).
+// The file is uploads/<id>.zip in PLUGIN_STORE_DIR; both expire after PLUGIN_UPLOAD_TTL_MS.
+model PluginUpload {
+  id           String   @id @default(cuid())
+  sha256       String
+  sizeBytes    Int
+  filename     String
+  slug         String
+  name         String
+  version      String
+  requiresWp   String?
+  requiresPhp  String?
+  uploadedById String
+  createdAt    DateTime @default(now())
+  expiresAt    DateTime
+
+  @@index([expiresAt])
+}
+
+// Custom-plugin rollout (Build Order step 10, spec §6.4). Status is DeploymentStatus in shared.
+model Deployment {
+  id              String             @id @default(cuid())
+  pluginVersionId String
+  pluginVersion   PluginVersion      @relation(fields: [pluginVersionId], references: [id])
+  requestedById   String
+  approvedById    String?
+  approvalId      String?
+  stagingFirst    Boolean            @default(true)
+  batchSize       Int                @default(2)
+  pauseOnFailure  Boolean            @default(true)
+  status          String // PENDING_APPROVAL | QUEUED | RUNNING | PAUSED | SUCCEEDED | FAILED | CANCELLED
+  createdAt       DateTime           @default(now())
+  startedAt       DateTime?
+  finishedAt      DateTime?
+  targets         DeploymentTarget[]
+
+  @@index([createdAt])
+  @@index([status])
+}
+
+model DeploymentTarget {
+  id            String          @id @default(cuid())
+  deploymentId  String
+  deployment    Deployment      @relation(fields: [deploymentId], references: [id], onDelete: Cascade)
+  siteId        String
+  site          Site            @relation(fields: [siteId], references: [id])
+  environmentId String
+  environment   SiteEnvironment @relation(fields: [environmentId], references: [id])
+  kind          EnvKind
+  status        TargetStatus    @default(QUEUED)
+  log           String          @default("")
+  backupId      String?
+  startedAt     DateTime?
+  finishedAt    DateTime?
+
+  @@index([deploymentId, status])
+  @@index([siteId])
+}
+
+// Quick pre-update snapshot (spec §6.5) or a later full backup. Location is a path inside
+// SNAPSHOT_STORE_DIR; the encrypted bytes are written by the runner (agent decision A68).
+model Backup {
+  id              String          @id @default(cuid())
+  siteId          String
+  site            Site            @relation(fields: [siteId], references: [id], onDelete: Cascade)
+  environmentId   String
+  environment     SiteEnvironment @relation(fields: [environmentId], references: [id], onDelete: Cascade)
+  kind            String // QUICK_SNAPSHOT | FULL
+  status          String          @default("PENDING") // PENDING | READY | FAILED | EXPIRED
+  pluginName      String?
+  pluginVersion   String?
+  includesDb      Boolean         @default(false)
+  location        String // e.g. quick/<id>.bin — never a user-supplied path
+  sha256          String?
+  sizeBytes       Int?
+  encrypted       Boolean         @default(true)
+  expiresAt       DateTime?
+  createdById     String?
+  createdAt       DateTime        @default(now())
+  restoredAt      DateTime?
+
+  @@index([siteId, createdAt])
+  @@index([environmentId, createdAt])
+  @@index([expiresAt])
+  @@index([status])
+}
+
+model ApprovalRequest {
+  id            String    @id @default(cuid())
+  action        String
+  payload       Json
+  requestedById String
+  decidedById   String?
+  status        String    @default("PENDING") // PENDING | APPROVED | REJECTED
+  comment       String?
+  createdAt     DateTime  @default(now())
+  decidedAt     DateTime?
+
+  @@index([status, createdAt])
+}
+
+model AuditLog {
+  id        String   @id @default(cuid())
+  userId    String?
+  action    String
+  siteIds   String[]
+  ip        String?
+  result    String
+  meta      Json?
+  createdAt DateTime @default(now())
+  // append-only: DB role has INSERT/SELECT only on this table
+}
+
+// Hub settings edited by Admins (e.g. the IP allowlist). Values never hold secrets.
+model Setting {
+  key         String   @id
+  value       Json
+  updatedAt   DateTime @default(now()) @updatedAt
+  updatedById String?
+}
+
+// WebAuthn passkeys, a second factor alongside TOTP (agent decision A45).
+model Passkey {
+  id           String    @id @default(cuid())
+  userId       String
+  user         User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  credentialId String    @unique // base64url
+  publicKey    Bytes // COSE public key; not a secret
+  counter      BigInt    @default(0)
+  transports   String[]
+  name         String
+  backedUp     Boolean   @default(false)
+  createdAt    DateTime  @default(now())
+  lastUsedAt   DateTime?
+
+  @@index([userId])
+}
+
+// One random challenge per passkey ceremony; single use, short-lived.
+model WebAuthnChallenge {
+  id               String    @id @default(cuid())
+  userId           String
+  user             User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  purpose          String // REGISTER | LOGIN
+  challenge        String
+  /// For LOGIN: the password-step AuthChallenge this ceremony belongs to.
+  loginChallengeId String?
+  expiresAt        DateTime
+  usedAt           DateTime?
+  createdAt        DateTime  @default(now())
+
+  @@index([userId, purpose])
+}

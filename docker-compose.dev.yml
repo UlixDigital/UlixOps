@@ -1,0 +1,15 @@
+# Dev-only overlay: publishes Postgres and Redis on 127.0.0.1 so `pnpm dev` on the host can reach
+# them. Never use on the production VPS.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml --profile testsite \
+#     up -d postgres redis test-wp test-wp-db test-wp-staging test-wp-staging-db
+services:
+  postgres:
+    ports: ["127.0.0.1:5432:5432"]
+    networks: [db, devhost]
+  redis:
+    ports: ["127.0.0.1:6379:6379"]
+    networks: [queue, devhost]
+
+networks:
+  devhost: {}

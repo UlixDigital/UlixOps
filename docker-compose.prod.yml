@@ -1,0 +1,33 @@
+# Production overlay for the VPS (used by scripts/deploy.sh):
+#   docker compose --env-file ~/ulixops.env -f docker-compose.yml -f docker-compose.prod.yml up -d
+# No hub port is published on the server. Cloudflare Tunnel is the only way in, and Cloudflare
+# Access (Zero Trust) checks every visitor before traffic reaches the tunnel (agent decision A18).
+services:
+  web:
+    ports: !reset []
+    environment:
+      CLIENT_IP_HEADER: cf-connecting-ip
+
+  api:
+    environment:
+      PUBLIC_URL: https://ulixops.ulixdigital.com
+
+  # Infisical unbounded Node heap was ~700–900MB+ and restarted 17× on a 4GB VPS with no swap,
+  # starving web/tunnel (A106). Cap below host starvation; 512/384 OOMs on boot (needs ~700MB).
+  infisical:
+    mem_limit: 896m
+    environment:
+      NODE_OPTIONS: --max-old-space-size=768
+
+  cloudflared:
+    image: cloudflare/cloudflared:2026.10.5
+    command: ["tunnel", "--no-autoupdate", "run"]
+    environment:
+      TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN:?set CLOUDFLARE_TUNNEL_TOKEN in the server env file}
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    restart: unless-stopped
+    networks: [edge]
+    depends_on:
+      web: { condition: service_started }
