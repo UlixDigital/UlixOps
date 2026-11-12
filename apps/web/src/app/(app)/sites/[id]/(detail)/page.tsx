@@ -1,15 +1,24 @@
 // Spec screen 5, Overview: per environment, the connection (Test connection, pinned host key),
-// inventory summary, and health (step 9). Last deploy arrives with step 10.
-import { can } from "@ulixops/shared";
+// inventory summary, and health (step 9); the site's last deploy (step 10) and last full backup
+// on Google Drive (A145).
+import { can, DeploymentList, FullBackupList } from "@ulixops/shared";
 import type { Metadata } from "next";
 import Link from "next/link";
 import { ActionForm } from "@/components/action-form";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Notice } from "@/components/ui/notice";
-import { requireSession } from "@/lib/auth";
+import { STATUS_TONE } from "@/app/(app)/deployments/status";
+import { apiGet } from "@/lib/api";
+import { apiAuth, requireSession } from "@/lib/auth";
 import { formatUtc, timeAgo } from "@/lib/format";
 import { loadSite } from "@/lib/site";
-import { connectionStatus, ENV_LABELS, healthStatus, siteHealthStatus } from "@/lib/site-status";
+import {
+  connectionStatus,
+  ENV_LABELS,
+  healthStatus,
+  phpStatus,
+  siteHealthStatus,
+} from "@/lib/site-status";
 import { cn } from "@/lib/utils";
 import { resetHostKeyAction } from "../../actions";
 import { AutoTestOnLoad } from "./auto-test";
@@ -18,6 +27,15 @@ import { RunHealthCheck } from "./run-health-check";
 import { TestConnection } from "./test-connection";
 
 export const metadata: Metadata = { title: "Site · UlixOps" };
+
+/** Plugin, theme and WordPress core updates from the last check (A135). */
+function updateCount(inv: {
+  pluginUpdates: number;
+  themeUpdates: number;
+  coreUpdateVersion?: string | null;
+}) {
+  return inv.pluginUpdates + inv.themeUpdates + (inv.coreUpdateVersion ? 1 : 0);
+}
 
 export default async function SiteOverviewPage({
   params,
@@ -38,6 +56,15 @@ export default async function SiteOverviewPage({
     ? `Checked ${timeAgo(production.lastHealthAt)}`
     : "Not checked yet";
   const testKinds = site.environments.map((e) => e.kind);
+  const auth = await apiAuth();
+  const [deploys, backups] = await Promise.all([
+    can(user.role, "deployments.view")
+      ? apiGet(`/deployments?siteId=${site.id}&limit=1`, DeploymentList, auth)
+      : null,
+    apiGet(`/full-backups?siteId=${site.id}&status=READY&limit=1`, FullBackupList, auth),
+  ]);
+  const lastDeploy = deploys?.ok ? (deploys.data.deployments[0] ?? null) : null;
+  const lastBackup = backups.ok ? (backups.data.backups[0] ?? null) : null;
 
   return (
     <div className="grid gap-4">
@@ -56,21 +83,77 @@ export default async function SiteOverviewPage({
               {healthHint}
             </span>
           </div>
-          <div className="grid gap-0.5">
+          <div className="grid min-w-0 gap-0.5">
             <span className="text-xs text-muted-foreground">Last deploy</span>
-            <span className="text-lg font-semibold" title="Deployments arrive in step 10">
-              —
-            </span>
-            <span className="text-xs text-muted-foreground">Deployments arrive in step 10</span>
+            {lastDeploy ? (
+              <>
+                <Link
+                  href={`/deployments/${lastDeploy.id}`}
+                  className="truncate text-lg font-semibold hover:underline"
+                  title={`${lastDeploy.pluginName} ${lastDeploy.version}`}
+                >
+                  {lastDeploy.pluginName} {lastDeploy.version}
+                </Link>
+                <span className="flex flex-wrap items-center gap-1.5 text-xs text-muted-foreground">
+                  <span
+                    className={cn(
+                      "rounded-md px-1.5 py-0.5 font-medium",
+                      STATUS_TONE[lastDeploy.status],
+                    )}
+                  >
+                    {lastDeploy.status.replaceAll("_", " ")}
+                  </span>
+                  <span title={formatUtc(lastDeploy.createdAt)}>
+                    {timeAgo(lastDeploy.createdAt)}
+                  </span>
+                </span>
+              </>
+            ) : (
+              <>
+                <span className="text-lg font-semibold">—</span>
+                <span className="text-xs text-muted-foreground">
+                  {deploys === null ? (
+                    "Deployments aren't visible to your role"
+                  ) : deploys.ok ? (
+                    <Link href={`/sites/${site.id}/deployments`} className="hover:underline">
+                      No deployments to this site yet
+                    </Link>
+                  ) : (
+                    "Couldn't load deployments"
+                  )}
+                </span>
+              </>
+            )}
           </div>
           <div className="grid gap-0.5">
             <span className="text-xs text-muted-foreground">Last backup</span>
-            <span className="text-lg font-semibold">
-              <Link href={`/sites/${site.id}/snapshots`} className="hover:underline">
-                Snapshots
-              </Link>
-            </span>
-            <span className="text-xs text-muted-foreground">Quick pre-update snapshots</span>
+            {lastBackup ? (
+              <>
+                <span
+                  className="text-lg font-semibold"
+                  title={formatUtc(lastBackup.finishedAt ?? lastBackup.startedAt)}
+                >
+                  {timeAgo(lastBackup.finishedAt ?? lastBackup.startedAt)}
+                </span>
+                <span className="text-xs text-muted-foreground">
+                  Full backup on Google Drive
+                  {lastBackup.environment === "STAGING" ? " (staging)" : ""} ·{" "}
+                  <Link href={`/sites/${site.id}/snapshots`} className="hover:underline">
+                    snapshots
+                  </Link>
+                </span>
+              </>
+            ) : (
+              <>
+                <span className="text-lg font-semibold">—</span>
+                <span className="text-xs text-muted-foreground">
+                  {backups.ok ? "No full backup on Drive yet · " : "Couldn't load backups · "}
+                  <Link href={`/sites/${site.id}/snapshots`} className="hover:underline">
+                    snapshots
+                  </Link>
+                </span>
+              </>
+            )}
           </div>
         </CardContent>
       </Card>
@@ -141,6 +224,22 @@ export default async function SiteOverviewPage({
                       ? `WordPress ${env.wpVersion} · PHP ${env.phpVersion ?? "?"} · WP-CLI ${env.wpCliVersion ?? "?"}`
                       : "—"}
                   </dd>
+                  <dt className="text-muted-foreground">PHP support</dt>
+                  <dd>
+                    {env.phpVersion ? (
+                      <span
+                        className={cn(
+                          "rounded-md px-1.5 py-0.5 text-xs font-medium",
+                          phpStatus(env.phpVersion).tone,
+                        )}
+                        title={phpStatus(env.phpVersion).title}
+                      >
+                        PHP {env.phpVersion} · {phpStatus(env.phpVersion).label}
+                      </span>
+                    ) : (
+                      "—"
+                    )}
+                  </dd>
                   <dt className="text-muted-foreground">Active theme</dt>
                   <dd>{inv?.activeTheme ?? "—"}</dd>
                   <dt className="text-muted-foreground">Plugins</dt>
@@ -153,10 +252,10 @@ export default async function SiteOverviewPage({
                         >
                           {inv.plugins} installed
                         </Link>
-                        {inv.pluginUpdates + inv.themeUpdates > 0 && (
+                        {updateCount(inv) > 0 && (
                           <Badge tone="warning">
-                            {inv.pluginUpdates + inv.themeUpdates} update
-                            {inv.pluginUpdates + inv.themeUpdates === 1 ? "" : "s"} available
+                            {updateCount(inv)} update
+                            {updateCount(inv) === 1 ? "" : "s"} available
                           </Badge>
                         )}
                       </>

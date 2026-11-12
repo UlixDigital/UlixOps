@@ -77,6 +77,13 @@ export const DeploymentList = z.object({
 });
 export type DeploymentList = z.infer<typeof DeploymentList>;
 
+/** GET /deployments: newest first; `siteId` keeps rollouts that touched that site. */
+export const DeploymentListQuery = z.object({
+  siteId: RecordId.optional(),
+  limit: z.coerce.number().int().min(1).max(50).default(50),
+});
+export type DeploymentListQuery = z.infer<typeof DeploymentListQuery>;
+
 export const CreateDeploymentResponse = z.object({
   deployment: DeploymentView,
   /** When set, the rollout waits for another Admin on the Approvals screen. */

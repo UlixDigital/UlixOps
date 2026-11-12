@@ -41,19 +41,51 @@ export interface SftpFile {
 export interface SshSession {
   readonly hostKey: string;
   exec(argv: readonly string[], timeoutMs?: number): Promise<ExecResult>;
+  /**
+   * Run argv and hand stdout to `onChunk` as it arrives, pausing the remote side until each
+   * chunk is handled (large transfers to disk, A138). Optional so test fakes can skip it.
+   */
+  execStream?(
+    argv: readonly string[],
+    onChunk: (chunk: Buffer) => Promise<"more" | "stop">,
+    timeoutMs: number,
+  ): Promise<{ exitCode: number; stderr: string; stopped: boolean }>;
+  /**
+   * Run argv with `source` as its stdin, waiting for the remote side to take each piece
+   * (restore, A152). `consumed` is false when the command ended before reading it all (tar
+   * --occurrence stops once it has the file). Optional so test fakes can skip it.
+   */
+  execUpload?(
+    argv: readonly string[],
+    source: AsyncIterable<Buffer>,
+    timeoutMs: number,
+  ): Promise<{ exitCode: number; stderr: string; consumed: boolean }>;
   /** Open an SFTP channel (ssh2 built-in; no extra dependency). */
   sftp(): Promise<SftpSession>;
   close(): void;
+}
+
+export interface SftpDirEntry {
+  name: string;
+  isDirectory: boolean;
+  isFile: boolean;
+  size: number;
+  /** Unix seconds; null when unknown. */
+  mtime: number | null;
 }
 
 export interface SftpSession {
   /** Stat a path; null when it does not exist. */
   stat(remotePath: string): Promise<{ isDirectory: boolean; size: number } | null>;
   readFile(remotePath: string, maxBytes?: number): Promise<Buffer>;
+  /** Read up to `maxBytes` from the start of a file (does not require the whole file to fit). */
+  readFileHead(remotePath: string, maxBytes?: number): Promise<Buffer>;
   /** Read up to `maxBytes` from the end of a file (for log tails). */
   readFileTail(remotePath: string, maxBytes?: number): Promise<Buffer>;
   writeFile(remotePath: string, data: Buffer): Promise<void>;
   mkdirp(remotePath: string): Promise<void>;
+  /** Non-recursive directory listing (A179 file manager). */
+  listDir(remotePath: string): Promise<SftpDirEntry[]>;
   /** Recursively list and read every regular file under `remoteDir`. */
   readTree(remoteDir: string): Promise<SftpFile[]>;
   /** Write files under `remoteDir` (relative paths). Creates directories as needed. */
@@ -68,17 +100,22 @@ export interface SftpSession {
 }
 
 export interface SshConnector {
-  connect(target: SshTarget, privateKey: string): Promise<SshSession>;
+  /** `secret` is a private key (default) or an SFTP password when `target.authMode === "password"` (A182). */
+  connect(target: SshTarget, secret: string): Promise<SshSession>;
 }
 
 /** ssh2 with strict host key checking: the pinned key must match; unpinned keys are recorded. */
 export const ssh2Connector: SshConnector = {
-  connect(target, privateKey) {
+  connect(target, secret) {
     return new Promise((resolve, reject) => {
       const client = new Client();
       let presented: string | null = null;
+      const auth =
+        target.authMode === "password" ? { password: secret } : { privateKey: secret };
       client
-        .on("ready", () => resolve(new Ssh2Session(client, presented ?? "")))
+        .on("ready", () =>
+          resolve(new Ssh2Session(client, presented ?? "", Boolean(target.nativeSftpOnly))),
+        )
         .on("error", (error) => {
           client.end();
           if (presented && target.hostKey && presented !== target.hostKey) {
@@ -91,9 +128,10 @@ export const ssh2Connector: SshConnector = {
           host: target.host,
           port: target.port,
           username: target.user,
-          privateKey,
+          ...auth,
           readyTimeout: 15_000,
-          keepaliveInterval: 0,
+          // Keep pooled Files sessions alive across folder clicks (A183); 0 used to drop idle sockets.
+          keepaliveInterval: 15_000,
           hostVerifier: (key: Buffer) => {
             presented = fingerprint(key);
             return target.hostKey === null || presented === target.hostKey;
@@ -103,10 +141,11 @@ export const ssh2Connector: SshConnector = {
   },
 };
 
-class Ssh2Session implements SshSession {
+export class Ssh2Session implements SshSession {
   constructor(
     private readonly client: Client,
     readonly hostKey: string,
+    private readonly nativeSftpOnly = false,
   ) {}
 
   exec(argv: readonly string[], timeoutMs = 60_000): Promise<ExecResult> {
@@ -141,11 +180,158 @@ class Ssh2Session implements SshSession {
     });
   }
 
+  execStream(
+    argv: readonly string[],
+    onChunk: (chunk: Buffer) => Promise<"more" | "stop">,
+    timeoutMs: number,
+  ): Promise<{ exitCode: number; stderr: string; stopped: boolean }> {
+    return new Promise((resolve, reject) => {
+      this.client.exec(shellQuote(argv), (error, stream) => {
+        if (error) {
+          reject(error);
+          return;
+        }
+        let stderr = "";
+        let stopped = false;
+        let settled = false;
+        let pending = Promise.resolve();
+        const finish = (outcome: { code: number } | { error: Error }) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          clearTimeout(grace);
+          if ("error" in outcome) reject(outcome.error);
+          else
+            resolve({
+              exitCode: outcome.code,
+              stderr: stderr.slice(0, MAX_OUTPUT_BYTES),
+              stopped,
+            });
+        };
+        // Stop reading but keep draining: a paused channel never reports "close" (A142).
+        const halt = () => {
+          stream.resume();
+          stream.close();
+        };
+        let grace: ReturnType<typeof setTimeout> | undefined;
+        const timer = setTimeout(() => {
+          halt();
+          finish({ error: new Error(`Command timed out after ${Math.round(timeoutMs / 1000)} s`) });
+        }, timeoutMs);
+        stream.on("data", (chunk: Buffer) => {
+          if (stopped || settled) return; // draining after stop: discard the rest
+          stream.pause();
+          pending = pending
+            .then(() => onChunk(chunk))
+            .then((next) => {
+              if (next !== "stop") {
+                stream.resume();
+                return;
+              }
+              stopped = true;
+              halt();
+              // Some servers never send "close" once we stop reading; don't wait for it forever.
+              grace = setTimeout(() => finish({ code: -1 }), 15_000);
+            })
+            .catch((err: unknown) => {
+              halt();
+              finish({ error: err instanceof Error ? err : new Error(String(err)) });
+            });
+        });
+        stream.stderr.on("data", (chunk: Buffer) => {
+          if (stderr.length < MAX_OUTPUT_BYTES) stderr += chunk.toString("utf8");
+        });
+        stream.on("close", (code: number | null) => {
+          void pending.then(() => finish({ code: code ?? -1 }));
+        });
+        stream.end();
+      });
+    });
+  }
+
+  execUpload(
+    argv: readonly string[],
+    source: AsyncIterable<Buffer>,
+    timeoutMs: number,
+  ): Promise<{ exitCode: number; stderr: string; consumed: boolean }> {
+    return new Promise((resolve, reject) => {
+      this.client.exec(shellQuote(argv), (error, stream) => {
+        if (error) {
+          reject(error);
+          return;
+        }
+        let stderr = "";
+        let exitCode = -1;
+        let closed = false;
+        let wake: (() => void) | null = null;
+        const exited = new Promise<void>((done) => {
+          stream.on("close", (code: number | null) => {
+            closed = true;
+            exitCode = code ?? -1;
+            wake?.();
+            done();
+          });
+        });
+        stream.on("data", () => undefined); // stdout isn't used; keep it flowing
+        stream.on("drain", () => wake?.());
+        stream.on("error", () => undefined); // writes after the remote end closed
+        stream.stderr.on("data", (chunk: Buffer) => {
+          if (stderr.length < MAX_OUTPUT_BYTES) stderr += chunk.toString("utf8");
+        });
+        let timedOut = false;
+        const timer = setTimeout(() => {
+          timedOut = true;
+          stream.close();
+        }, timeoutMs);
+        const pump = async (): Promise<boolean> => {
+          try {
+            for await (const chunk of source) {
+              if (closed) return false;
+              if (!stream.write(chunk) && !closed)
+                await new Promise<void>((go) => {
+                  wake = go;
+                });
+              wake = null;
+            }
+          } catch (err) {
+            stream.close();
+            await exited;
+            throw err;
+          }
+          if (!closed) stream.end();
+          await exited;
+          return true;
+        };
+        pump().then(
+          (consumed) => {
+            clearTimeout(timer);
+            if (timedOut)
+              reject(new Error(`Command timed out after ${Math.round(timeoutMs / 1000)} s`));
+            else resolve({ exitCode, stderr: stderr.slice(0, MAX_OUTPUT_BYTES), consumed });
+          },
+          (err: unknown) => {
+            clearTimeout(timer);
+            reject(err instanceof Error ? err : new Error(String(err)));
+          },
+        );
+      });
+    });
+  }
+
   sftp(): Promise<SftpSession> {
     return new Promise((resolve, reject) => {
       this.client.sftp((error, sftp) => {
         if (!error && sftp) {
           resolve(new Ssh2Sftp(sftp));
+          return;
+        }
+        if (this.nativeSftpOnly) {
+          reject(
+            new Error(
+              error?.message ||
+                "SFTP is not available on this host. Check the dedicated SFTP host/port (FileZilla settings), or clear Files SFTP and use SSH.",
+            ),
+          );
           return;
         }
         // WP Engine SSH Gateway (and some hosts) refuse the SFTP subsystem; fall back to
@@ -181,6 +367,14 @@ class Ssh2Sftp implements SftpSession {
 
   readFile(remotePath: string, maxBytes = MAX_SFTP_FILE_BYTES): Promise<Buffer> {
     return this.readFileRange(remotePath, 0, undefined, maxBytes);
+  }
+
+  async readFileHead(remotePath: string, maxBytes = MAX_SFTP_FILE_BYTES): Promise<Buffer> {
+    const info = await this.stat(remotePath);
+    if (!info) throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+    if (info.size === 0 || maxBytes <= 0) return Buffer.alloc(0);
+    const length = Math.min(info.size, maxBytes);
+    return this.readFileRange(remotePath, 0, length - 1, maxBytes);
   }
 
   async readFileTail(remotePath: string, maxBytes = MAX_SFTP_FILE_BYTES): Promise<Buffer> {
@@ -249,34 +443,53 @@ class Ssh2Sftp implements SftpSession {
     }
   }
 
+  async listDir(remotePath: string): Promise<SftpDirEntry[]> {
+    const entries = await new Promise<
+      {
+        filename: string;
+        attrs: { mode?: number; size?: number; mtime?: number };
+      }[]
+    >((resolve, reject) => {
+      this.sftp.readdir(remotePath, (error, list) => (error ? reject(error) : resolve(list)));
+    });
+    const out: SftpDirEntry[] = [];
+    for (const entry of entries) {
+      if (entry.filename === "." || entry.filename === "..") continue;
+      if (
+        entry.filename.includes("..") ||
+        entry.filename.includes("/") ||
+        entry.filename.includes("\\") ||
+        entry.filename.includes("\0")
+      ) {
+        throw new Error(`Refused remote name: ${entry.filename}`);
+      }
+      const mode = entry.attrs.mode ?? 0;
+      const isDirectory = (mode & 0o170000) === 0o040000;
+      const isFile = (mode & 0o170000) === 0o100000;
+      out.push({
+        name: entry.filename,
+        isDirectory,
+        isFile,
+        size: entry.attrs.size ?? 0,
+        mtime: typeof entry.attrs.mtime === "number" ? entry.attrs.mtime : null,
+      });
+    }
+    return out;
+  }
+
   async readTree(remoteDir: string): Promise<SftpFile[]> {
     const files: SftpFile[] = [];
     let totalBytes = 0;
     const walk = async (dir: string, prefix: string) => {
-      const entries = await new Promise<
-        { filename: string; longname: string; attrs: { mode?: number; size?: number } }[]
-      >((resolve, reject) => {
-        this.sftp.readdir(dir, (error, list) => (error ? reject(error) : resolve(list)));
-      });
+      const entries = await this.listDir(dir);
       for (const entry of entries) {
-        if (entry.filename === "." || entry.filename === "..") continue;
-        if (
-          entry.filename.includes("..") ||
-          entry.filename.includes("/") ||
-          entry.filename.includes("\\")
-        ) {
-          throw new Error(`Refused remote name: ${entry.filename}`);
-        }
-        const full = `${dir}/${entry.filename}`;
-        const rel = prefix ? `${prefix}/${entry.filename}` : entry.filename;
-        const mode = entry.attrs.mode ?? 0;
-        const isDir = (mode & 0o170000) === 0o040000;
-        const isFile = (mode & 0o170000) === 0o100000;
-        if (isDir) {
+        const full = `${dir}/${entry.name}`;
+        const rel = prefix ? `${prefix}/${entry.name}` : entry.name;
+        if (entry.isDirectory) {
           await walk(full, rel);
           continue;
         }
-        if (!isFile) continue; // skip symlinks and specials
+        if (!entry.isFile) continue; // skip symlinks and specials
         if (files.length >= MAX_SFTP_FILES) throw new Error("Too many files in plugin folder");
         const data = await this.readFile(full);
         totalBytes += data.length;

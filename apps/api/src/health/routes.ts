@@ -139,7 +139,7 @@ export function healthSiteRouter(deps: HealthDeps): Router {
     try {
       // Loopback site URLs (local test-wp) are rewritten to the SSH host for the runner (A80).
       fetchOrigin = healthFetchOrigin(env.url, env.sshHost);
-      urls = buildHealthUrls(fetchOrigin, settings.extraPaths);
+      urls = buildHealthUrls(fetchOrigin, settings);
     } catch {
       res.status(422).json({ error: "bad_request" });
       return;

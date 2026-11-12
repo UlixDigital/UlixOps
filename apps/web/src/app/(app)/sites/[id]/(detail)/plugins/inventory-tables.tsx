@@ -5,7 +5,12 @@ import type { ColumnDef } from "@tanstack/react-table";
 import { useMemo } from "react";
 import { ActionForm } from "@/components/action-form";
 import { DataTable } from "@/components/data-table";
-import { siteActionAction, updatePluginAction, updateThemeAction } from "../../../actions";
+import {
+  deleteAssetAction,
+  siteActionAction,
+  updatePluginAction,
+  updateThemeAction,
+} from "../../../actions";
 import { Badge } from "../parts";
 
 const STATUS: Record<InventoryItem["status"], { label: string; tone: "success" | "muted" }> = {
@@ -17,7 +22,8 @@ const STATUS: Record<InventoryItem["status"], { label: string; tone: "success" |
   dropin: { label: "Drop-in", tone: "muted" },
 };
 
-const baseColumns = <T extends InventoryItem>(): ColumnDef<T>[] => [
+// Without a real update check, "no update" only means "not checked" (A114 / A135).
+const baseColumns = <T extends InventoryItem>(updatesChecked: boolean): ColumnDef<T>[] => [
   {
     id: "name",
     header: "Name",
@@ -45,8 +51,12 @@ const baseColumns = <T extends InventoryItem>(): ColumnDef<T>[] => [
     cell: ({ row }) =>
       row.original.updateVersion ? (
         <Badge tone="warning">{row.original.updateVersion} available</Badge>
-      ) : (
+      ) : updatesChecked ? (
         <span className="text-muted-foreground">Up to date</span>
+      ) : (
+        <span className="text-muted-foreground" title="Use Check for updates">
+          Not checked
+        </span>
       ),
   },
 ];
@@ -58,6 +68,8 @@ export function PluginsTable({
   canActivate,
   canDeactivate,
   canUpdate,
+  canDelete,
+  updatesChecked,
 }: {
   siteId: string;
   kind: EnvKind;
@@ -65,11 +77,13 @@ export function PluginsTable({
   canActivate: boolean;
   canDeactivate: boolean;
   canUpdate: boolean;
+  canDelete: boolean;
+  updatesChecked: boolean;
 }) {
   const where = kind === "PRODUCTION" ? "production" : "staging";
   const columns = useMemo<ColumnDef<InventoryItem>[]>(
     () => [
-      ...baseColumns<InventoryItem>(),
+      ...baseColumns<InventoryItem>(updatesChecked),
       {
         id: "actions",
         header: () => <span className="sr-only">Actions</span>,
@@ -81,7 +95,8 @@ export function PluginsTable({
           const activate = p.status === "inactive";
           const showToggle = activate ? canActivate : canDeactivate;
           const showUpdate = canUpdate && Boolean(p.updateVersion);
-          if (!showToggle && !showUpdate) return null;
+          const showDelete = canDelete && p.status === "inactive";
+          if (!showToggle && !showUpdate && !showDelete) return null;
           return (
             <div className="flex flex-wrap items-center gap-2">
               {showUpdate && (
@@ -120,12 +135,15 @@ export function PluginsTable({
                   <input type="hidden" name="plugin" value={p.name} />
                 </ActionForm>
               )}
+              {showDelete && (
+                <DeleteButton siteId={siteId} kind={kind} where={where} asset="plugin" item={p} />
+              )}
             </div>
           );
         },
       },
     ],
-    [siteId, kind, where, canActivate, canDeactivate, canUpdate],
+    [siteId, kind, where, canActivate, canDeactivate, canUpdate, canDelete, updatesChecked],
   );
   return (
     <DataTable
@@ -143,41 +161,56 @@ export function ThemesTable({
   kind,
   themes,
   canUpdate,
+  canDelete,
+  updatesChecked,
 }: {
   siteId: string;
   kind: EnvKind;
   themes: InventoryItem[];
   canUpdate: boolean;
+  canDelete: boolean;
+  updatesChecked: boolean;
 }) {
   const where = kind === "PRODUCTION" ? "production" : "staging";
   const columns = useMemo<ColumnDef<InventoryItem>[]>(
     () => [
-      ...baseColumns<InventoryItem>(),
+      ...baseColumns<InventoryItem>(updatesChecked),
       {
         id: "actions",
         header: () => <span className="sr-only">Actions</span>,
         enableSorting: false,
         cell: ({ row }) => {
           const t = row.original;
-          if (!ThemeName.safeParse(t.name).success || !t.updateVersion || !canUpdate) return null;
+          if (!ThemeName.safeParse(t.name).success) return null;
+          const showUpdate = canUpdate && Boolean(t.updateVersion);
+          // Never the active theme or the parent of the active child theme.
+          const showDelete = canDelete && t.status === "inactive";
+          if (!showUpdate && !showDelete) return null;
           return (
-            <ActionForm
-              action={updateThemeAction}
-              submitLabel="Update"
-              confirm={{
-                title: `Update theme ${t.title || t.name} on ${where}?`,
-                description: `UlixOps will take a quick snapshot of the theme folder first${t.version.split(".")[0] !== t.updateVersion.split(".")[0] ? " (and the database, because this looks like a major version bump)" : ""}, then run the update.`,
-              }}
-            >
-              <input type="hidden" name="siteId" value={siteId} />
-              <input type="hidden" name="kind" value={kind} />
-              <input type="hidden" name="theme" value={t.name} />
-            </ActionForm>
+            <div className="flex flex-wrap items-center gap-2">
+              {showUpdate && t.updateVersion && (
+                <ActionForm
+                  action={updateThemeAction}
+                  submitLabel="Update"
+                  confirm={{
+                    title: `Update theme ${t.title || t.name} on ${where}?`,
+                    description: `UlixOps will take a quick snapshot of the theme folder first${t.version.split(".")[0] !== t.updateVersion.split(".")[0] ? " (and the database, because this looks like a major version bump)" : ""}, then run the update.`,
+                  }}
+                >
+                  <input type="hidden" name="siteId" value={siteId} />
+                  <input type="hidden" name="kind" value={kind} />
+                  <input type="hidden" name="theme" value={t.name} />
+                </ActionForm>
+              )}
+              {showDelete && (
+                <DeleteButton siteId={siteId} kind={kind} where={where} asset="theme" item={t} />
+              )}
+            </div>
           );
         },
       },
     ],
-    [siteId, kind, where, canUpdate],
+    [siteId, kind, where, canUpdate, canDelete, updatesChecked],
   );
   return (
     <DataTable
@@ -187,5 +220,38 @@ export function ThemesTable({
       emptyText="No themes match."
       initialSorting={[{ id: "status", desc: false }]}
     />
+  );
+}
+
+/** Delete an inactive plugin or theme; the folder is snapshotted first (A137). */
+function DeleteButton({
+  siteId,
+  kind,
+  where,
+  asset,
+  item,
+}: {
+  siteId: string;
+  kind: EnvKind;
+  where: string;
+  asset: "plugin" | "theme";
+  item: InventoryItem;
+}) {
+  return (
+    <ActionForm
+      action={deleteAssetAction}
+      submitLabel="Delete"
+      variant="destructive"
+      pendingLabel="Deleting…"
+      confirm={{
+        title: `Delete ${asset} ${item.title || item.name} ${item.version} from ${where}?`,
+        description: `UlixOps snapshots the ${asset} folder first, then deletes its files. ${asset === "plugin" ? "Its uninstall routine does not run, so its settings stay in the database. " : ""}To bring it back, restore the snapshot from Snapshots & backups.`,
+      }}
+    >
+      <input type="hidden" name="siteId" value={siteId} />
+      <input type="hidden" name="kind" value={kind} />
+      <input type="hidden" name="asset" value={asset} />
+      <input type="hidden" name="name" value={item.name} />
+    </ActionForm>
   );
 }

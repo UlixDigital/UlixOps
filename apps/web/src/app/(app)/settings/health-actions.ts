@@ -58,10 +58,12 @@ export async function saveHealthCheckAction(
   }
 
   const checkErrorLog = form.get("checkErrorLog") === "on";
+  const checkWpAdmin = form.get("checkWpAdmin") === "on";
   const parsed = HealthCheckSettings.safeParse({
     extraPaths: paths,
     thresholdMs,
     checkErrorLog,
+    checkWpAdmin,
   });
   if (!parsed.success) return { error: "Check the paths and threshold, then try again." };
 

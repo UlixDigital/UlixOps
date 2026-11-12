@@ -100,6 +100,7 @@ describe.runIf(TEST_DATABASE_URL)("notifications (Postgres)", () => {
     expect(list.body.notifications[0]).toMatchObject({
       kind: "security.NEW_DEVICE_LOGIN",
       title: "Sign-in from a new device",
+      alert: { actionable: false, status: "INFO" },
     });
     expect(mails).toHaveLength(1);
     expect(mails[0]?.to).toEqual(["admin@example.test"]);

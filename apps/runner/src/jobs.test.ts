@@ -17,7 +17,7 @@ const target: SshTarget = {
 };
 
 function fakeSsh(outputs: Record<string, Partial<ExecResult>>) {
-  const exec = vi.fn(async (argv: readonly string[]): Promise<ExecResult> => {
+  const exec = vi.fn(async (argv: readonly string[], _timeoutMs?: number): Promise<ExecResult> => {
     const out = outputs[argv.join(" ")] ?? { exitCode: 127, stderr: "not found" };
     return { exitCode: 0, stdout: "", stderr: "", ...out };
   });
@@ -25,12 +25,14 @@ function fakeSsh(outputs: Record<string, Partial<ExecResult>>) {
     hostKey: `SHA256:${"B".repeat(43)}`,
     exec,
     // Inventory checks for a leftover `.maintenance` file (A111); default = absent.
-    sftp: vi.fn(async () => ({
+      sftp: vi.fn(async () => ({
       stat: vi.fn(async () => null),
       readFile: vi.fn(),
+      readFileHead: vi.fn(),
       readFileTail: vi.fn(),
       writeFile: vi.fn(),
       mkdirp: vi.fn(),
+      listDir: vi.fn(async () => []),
       readTree: vi.fn(async () => []),
       writeTree: vi.fn(),
       rename: vi.fn(),
@@ -182,19 +184,31 @@ describe("runner jobs", () => {
       { type: "remote.command", target, command: { op: "plugin.list" } },
       { vault: vaultWith(), ssh: connector },
     );
-    expect(exec).toHaveBeenCalledWith([
-      "wp",
-      "--path=/var/www/html",
-      "plugin",
-      "list",
-      "--format=json",
-      FIELDS,
-    ]);
+    expect(exec).toHaveBeenCalledWith(
+      ["wp", "--path=/var/www/html", "plugin", "list", "--format=json", FIELDS],
+      60_000,
+    );
     expect(result).toMatchObject({
       hostKeyMismatch: false,
       exitCode: 0,
       stdout: "[] [redacted private key]",
     });
+  });
+
+  it("gives plugin.update five minutes so large plugins like Elementor can finish (A131)", async () => {
+    const { connector, exec } = fakeSsh({
+      "wp --path=/var/www/html plugin update elementor": {
+        stdout: "Success: Updated 1 of 1 plugins.",
+      },
+    });
+    await handleJob(
+      { type: "remote.command", target, command: { op: "plugin.update", slug: "elementor" } },
+      { vault: vaultWith(), ssh: connector },
+    );
+    expect(exec).toHaveBeenCalledWith(
+      ["wp", "--path=/var/www/html", "plugin", "update", "elementor"],
+      300_000,
+    );
   });
 
   it("answers a changed host key without running anything", async () => {
@@ -215,6 +229,30 @@ describe("runner jobs", () => {
         presented,
       });
     }
+  });
+
+  it("never runs a backup or restore stream as a plain command (A152)", async () => {
+    const connector: SshConnector = { connect: vi.fn() };
+    for (const command of [
+      { op: "backup.archive", wpPath: "/var/www/html", dbFile: "/tmp/ulixops-a.sql" },
+      { op: "restore.database", dbFile: "/tmp/ulixops-a.sql" },
+      {
+        op: "restore.files",
+        wpPath: "/var/www/html",
+        dbFile: "/tmp/ulixops-a.sql",
+        wpContent: false,
+      },
+      { op: "db.reset" },
+      { op: "restore.clear-content", wpPath: "/var/www/html" },
+      { op: "db.search-replace", from: "a.example", to: "b.example", escaped: false },
+    ])
+      await expect(
+        handleJob(
+          { type: "remote.command", target, command },
+          { vault: vaultWith(), ssh: connector },
+        ),
+      ).rejects.toThrow(/can't run as a plain command/);
+    expect(connector.connect).not.toHaveBeenCalled();
   });
 });
 
@@ -267,6 +305,10 @@ describe("site inventory", () => {
       "Update availability was not checked (use Check for updates).",
     );
     expect(result.warnings).toContain("Skipped entries WP-CLI reported oddly: weird");
+    expect(result).toMatchObject({ updatesChecked: false, coreUpdateVersion: null });
+    expect(
+      exec.mock.calls.some(([argv]) => (argv as string[]).join(" ").includes("check-update")),
+    ).toBe(false);
     const listCalls = exec.mock.calls.map(([argv]) => (argv as string[]).join(" "));
     expect(
       listCalls.some(
@@ -285,16 +327,28 @@ describe("site inventory", () => {
       [`${P} plugin list --format=json ${FIELDS}`]: { stdout: plugins },
       [`${P} theme list --format=json ${FIELDS}`]: { stdout: themes },
       [`${P} maintenance-mode is-active ${SAFE}`]: { exitCode: 1 },
+      // PHP notice noise around the JSON, several offers: the newest wins (A135).
+      [`${P} core check-update --format=json --fields=version,update_type ${SAFE}`]: {
+        stdout: `Notice: something\n${JSON.stringify([
+          { version: "7.2.1", update_type: "major" },
+          { version: "7.1.10", update_type: "minor" },
+          { version: "latest; id", update_type: "major" },
+        ])}`,
+      },
     });
     const result = (await handleJob(
       { type: "site.inventory", target, checkUpdates: true },
       { vault: vaultWith(), ssh: connector },
     )) as {
+      updatesChecked: boolean;
+      coreUpdateVersion: string | null;
       safeMode: boolean;
       plugins: { name: string; updateVersion: string | null }[];
       themes: { name: string; updateVersion: string | null }[];
     };
     expect(result.safeMode).toBe(false);
+    expect(result.updatesChecked).toBe(true);
+    expect(result.coreUpdateVersion).toBe("7.2.1");
     expect(result.plugins.find((p) => p.name === "akismet")?.updateVersion).toBe("5.4");
     expect(result.themes.find((t) => t.name === "parent")?.updateVersion).toBe("newer version");
     const listCalls = exec.mock.calls.map(([argv]) => (argv as string[]).join(" "));

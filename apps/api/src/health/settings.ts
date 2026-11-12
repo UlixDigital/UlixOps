@@ -11,6 +11,7 @@ const DEFAULT: HealthSettings = {
   extraPaths: [],
   thresholdMs: DEFAULT_HEALTH_THRESHOLD_MS,
   checkErrorLog: true,
+  checkWpAdmin: false,
 };
 
 export async function readHealthSettings(db: Db): Promise<HealthSettings> {

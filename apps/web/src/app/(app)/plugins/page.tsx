@@ -29,11 +29,16 @@ export default async function PluginsPage() {
             site&apos;s last inventory.
           </p>
         </div>
-        {upload && (
-          <Link href="/plugins/upload" className={buttonVariants()}>
-            Upload plugin version
+        <div className="flex flex-wrap gap-2">
+          <Link href="/plugins/scheduled" className={buttonVariants({ variant: "outline" })}>
+            Scheduled updates
           </Link>
-        )}
+          {upload && (
+            <Link href="/plugins/upload" className={buttonVariants()}>
+              Upload plugin version
+            </Link>
+          )}
+        </div>
       </div>
       {!res.ok ? (
         <Notice tone="error">The registry couldn&apos;t be loaded. Refresh the page.</Notice>

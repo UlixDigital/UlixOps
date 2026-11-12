@@ -11,8 +11,18 @@ import { createSmtpMailer, createSlackPoster, defaultMailFrom } from "./notifica
 import { createHubNotifier } from "./notify";
 import { PluginStore } from "./plugins/store";
 import { BullRunnerClient } from "./runner/client";
+import { recoverInterruptedDeployments } from "./deployments/orchestrator";
 import { recoverOrphanedBulkUpdates } from "./snapshots/bulk-update-run";
 import { SnapshotStore } from "./snapshots/store";
+import { expireStaleRestores } from "./full-backups/restore";
+import { expireStaleBackups } from "./full-backups/service";
+import { expireStaleChecks } from "./integrity/service";
+import { startExpiryScheduler } from "./monitoring/expiry";
+import { startUptimeScheduler } from "./monitoring/uptime";
+import { interruptRunningScans, startMalwareScheduler } from "./malware/service";
+import { startVulnScheduler } from "./vulnerabilities/scheduler";
+import { VisualStore } from "./visual/store";
+import { startReportScheduler } from "./reports/scheduler";
 
 const env = loadEnv();
 const db = createPrisma(env.DATABASE_URL);
@@ -50,6 +60,22 @@ const auth = new AuthService({
 });
 
 await recoverOrphanedBulkUpdates(db, now);
+// Rollouts run in memory: pause any a restart stranded, never resume them unattended (A155).
+await recoverInterruptedDeployments({ db, now, notifier });
+await interruptRunningScans(db, now());
+await expireStaleChecks(db, now(), true);
+await expireStaleBackups(db, now(), true);
+await expireStaleRestores(db, now(), true);
+// Daily Wordfence feed sync and re-match (Phase 2 step 2, A132).
+const stopVulnScheduler = startVulnScheduler({ db, now, runner, notifier });
+// Weekly malware scan rotation, one production site at a time (Phase 2 step 3, A138).
+const stopMalwareScheduler = startMalwareScheduler({ db, now, runner, notifier });
+// Daily SSL certificate and domain expiry check of every site (Phase 3 step 1, A148).
+const stopExpiryScheduler = startExpiryScheduler({ db, now, runner, notifier });
+// Uptime check of every production site every 5 minutes (Phase 3 step 2, A149).
+const stopUptimeScheduler = startUptimeScheduler({ db, now, runner, notifier });
+// Monthly site reports on the 1st UTC (Phase 4 P4-4, A165).
+const stopReportScheduler = startReportScheduler({ db, now, notifier, mailer });
 
 const server = createApp({
   auth,
@@ -58,8 +84,10 @@ const server = createApp({
   runner,
   pluginStore: new PluginStore(env.PLUGIN_STORE_DIR),
   snapshotStore: new SnapshotStore(env.SNAPSHOT_STORE_DIR),
+  visualStore: new VisualStore(env.VISUAL_STORE_DIR),
   defaultRetentionDays: env.SNAPSHOT_RETENTION_DAYS,
   notifier,
+  mailer,
   sessionSecret: env.SESSION_SECRET,
   publicUrl: env.PUBLIC_URL,
   envAllowedIps: parseIpList(env.ALLOWED_IPS),
@@ -77,6 +105,11 @@ const server = createApp({
 
 function shutdown(signal: NodeJS.Signals) {
   console.log(`api: ${signal} received, shutting down`);
+  stopVulnScheduler();
+  stopMalwareScheduler();
+  stopExpiryScheduler();
+  stopUptimeScheduler();
+  stopReportScheduler();
   server.close(() => {
     void Promise.allSettled([db.$disconnect(), redis.quit(), runner.close()]).then(() =>
       process.exit(0),

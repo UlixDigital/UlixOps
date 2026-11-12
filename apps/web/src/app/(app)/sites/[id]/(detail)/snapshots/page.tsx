@@ -1,7 +1,8 @@
 // Spec screen 5 tab + screen 13 (site-scoped): quick snapshots with restore.
-import { BackupList, can, siteActionPermission } from "@ulixops/shared";
+import { BackupList, can, isClientViewer, siteActionPermission } from "@ulixops/shared";
 import type { Metadata } from "next";
 import { ActionForm } from "@/components/action-form";
+import { NoAccess } from "@/components/no-access";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -31,6 +32,9 @@ export default async function SnapshotsPage({
   searchParams: Promise<{ env?: string | string[] }>;
 }) {
   const { user } = await requireSession();
+  if (isClientViewer(user.role)) {
+    return <NoAccess role={user.role} what="snapshots & backups" />;
+  }
   const site = await loadSite((await params).id);
   const env = pickEnvironment(site, (await searchParams).env);
   const blocked = remoteBlocker(site, env);

@@ -152,20 +152,19 @@ describe.runIf(host && port)(
       expect(await health()).toBe(true);
 
       const beforeBroken = randomUUID().replace(/-/g, "").slice(0, 24);
-      expect(
-        (
-          (await handleJob(
-            {
-              type: "site.snapshot",
-              target: target(),
-              backupId: beforeBroken,
-              plugin: slug,
-              includeDb: false,
-            },
-            deps(),
-          )) as { ok: boolean }
-        ).ok,
-      ).toBe(true);
+      const snapshot = (await handleJob(
+        {
+          type: "site.snapshot",
+          target: target(),
+          backupId: beforeBroken,
+          plugin: slug,
+          includeDb: false,
+        },
+        deps(),
+      )) as { ok: boolean; location: string | null };
+      expect(snapshot.ok).toBe(true);
+      // Content-addressed blobs (A103) are found by location, not by backup id.
+      expect(snapshot.location).toMatch(/^quick\//);
 
       const bad = storeZip(buildPluginZip({ slug, version: "2.0.0-broken", broken: true }));
       expect(
@@ -193,6 +192,7 @@ describe.runIf(host && port)(
               backupId: beforeBroken,
               plugin: slug,
               includesDb: false,
+              location: snapshot.location ?? undefined,
             },
             deps(),
           )) as { ok: boolean }

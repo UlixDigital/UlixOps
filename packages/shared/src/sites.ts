@@ -9,6 +9,9 @@ import {
   SshHost,
   TestStep,
 } from "./queue";
+import { BACKUP_KEY_REF } from "./backups";
+import { UptimeSummary } from "./monitoring";
+import { API_KEY_NAMES, VulnSummary } from "./vulnerabilities";
 
 const id = z.string().regex(/^[a-z0-9]{1,64}$/);
 const iso = z.iso.datetime();
@@ -49,6 +52,55 @@ export const UpdateSiteRequest = z.object({
   staging: EnvironmentInput.nullable().optional(),
 });
 
+/**
+ * Optional dedicated SFTP for the Files tab (A180/A182). WP Engine SSH gateway has no real SFTP
+ * subsystem (slow ShellFs); FileZilla-style `*.sftp.wpengine.com:2222` is fast. Auth may be an
+ * SSH vault key or an SFTP password (sealed to the vault; never returned).
+ */
+const FilesSftpBase = z.object({
+  host: SshHost,
+  port: z.number().int().min(1).max(65535).default(2222),
+  user: z.string().regex(/^[A-Za-z0-9._-]{1,64}$/),
+  path: WpPath,
+});
+
+export const FilesSftpConnection = z.discriminatedUnion("authKind", [
+  FilesSftpBase.extend({
+    authKind: z.literal("key"),
+    credentialRef: CredentialRef,
+  }),
+  FilesSftpBase.extend({
+    authKind: z.literal("password"),
+    /** Required when first enabling password auth or rotating; omit to keep the stored password. */
+    password: z.string().min(1).max(128).optional(),
+  }),
+]);
+export type FilesSftpConnection = z.infer<typeof FilesSftpConnection>;
+
+export const FilesSftpConnectionView = z.object({
+  enabled: z.boolean(),
+  host: z.string().nullable(),
+  port: z.number().int().nullable(),
+  user: z.string().nullable(),
+  path: z.string().nullable(),
+  authKind: z.enum(["key", "password"]),
+  credentialRef: z.string().nullable(),
+  /** True when a password is stored in the vault (value never returned). */
+  passwordSet: z.boolean(),
+  hostKeyPinned: z.boolean(),
+});
+export type FilesSftpConnectionView = z.infer<typeof FilesSftpConnectionView>;
+
+/** PUT body: null clears the dedicated SFTP settings. */
+export const FilesSftpConnectionUpdate = z.union([FilesSftpConnection, z.null()]);
+export type FilesSftpConnectionUpdate = z.infer<typeof FilesSftpConnectionUpdate>;
+
+/** Stable vault name for an environment's Files SFTP password (A182). */
+export function filesSftpPasswordRefFor(environmentId: string): string {
+  const id = environmentId.replace(/[^a-zA-Z0-9]/g, "").toUpperCase().slice(0, 40);
+  return `FILES_SFTP_${id}`;
+}
+
 export const EnvironmentView = EnvironmentInput.extend({
   kind: EnvKind,
   hostKey: HostKeyFingerprint.nullable(),
@@ -72,8 +124,16 @@ export const EnvironmentView = EnvironmentInput.extend({
       themeUpdates: z.number().int(),
       maintenance: z.boolean().nullable(),
       safeMode: z.boolean(),
+      coreUpdateVersion: z.string().nullable().optional(),
+      updatesCheckedAt: iso.nullable().optional(),
     })
     .nullable(),
+  /** Open vulnerability findings (Phase 2 step 2); absent from older API builds. */
+  vulnerabilities: VulnSummary.optional(),
+  /** Uptime monitoring (Phase 3 step 2, production only); absent from older API builds. */
+  uptime: UptimeSummary.optional(),
+  /** Dedicated SFTP for Files (A180); absent from older API builds. */
+  filesSftp: FilesSftpConnectionView.optional(),
 });
 export type EnvironmentView = z.infer<typeof EnvironmentView>;
 
@@ -127,6 +187,10 @@ export const InventoryView = z.object({
   warnings: z.array(z.string()),
   plugins: z.array(InventoryItem).max(MAX_INVENTORY_ITEMS),
   themes: z.array(InventoryItem).max(MAX_INVENTORY_ITEMS),
+  /** Newest WordPress release offered at the last update check (A135). */
+  coreUpdateVersion: z.string().nullable().optional(),
+  /** Last real update check; until then "up to date" is unknown (A135). */
+  updatesCheckedAt: iso.nullable().optional(),
 });
 export type InventoryView = z.infer<typeof InventoryView>;
 export const InventoryResponse = z.object({ inventory: InventoryView.nullable() });
@@ -226,6 +290,54 @@ export type CredentialView = z.infer<typeof CredentialView>;
 export const CredentialList = z.object({ credentials: z.array(CredentialView) });
 export const CreateCredentialRequest = z.object({ name: CredentialRef });
 export const CreateCredentialResponse = z.object({ name: CredentialRef, publicKey: z.string() });
+
+// ---- Integration API keys (A133) -------------------------------------------------------------
+// Entered in Settings → Credentials after a second Admin approves; stored only in the vault.
+
+/** Vault names of integration API keys the UI may set. */
+export const ApiKeyName = z.enum(API_KEY_NAMES);
+export type ApiKeyName = z.infer<typeof ApiKeyName>;
+
+/** How long the requester has to enter the key once approved. */
+export const API_KEY_WINDOW_MS = 24 * 60 * 60_000;
+
+/** Token-like keys only: no spaces or quotes, so nothing odd reaches the vault or a header. */
+export const ApiKeyValue = z
+  .string()
+  .trim()
+  .regex(/^[A-Za-z0-9._-]{16,300}$/, "16–300 letters, digits, dots, dashes or underscores");
+
+export const SetApiKeyRequest = z.object({ approvalId: id, value: ApiKeyValue });
+
+/** The backup encryption key: exactly 32 bytes as hex (`openssl rand -hex 32`), A145. */
+export const BackupKeyValue = z
+  .string()
+  .trim()
+  .regex(/^[0-9a-fA-F]{64}$/, "64 hex characters");
+
+/** Value rules per key name. */
+export function apiKeyValueFor(name: string) {
+  return name === BACKUP_KEY_REF ? BackupKeyValue : ApiKeyValue;
+}
+
+export const ApiKeyStatus = z.object({
+  name: ApiKeyName,
+  /** When the vault value last changed; null if not set (or the vault couldn't be reached). */
+  setAt: iso.nullable(),
+  vaultReachable: z.boolean(),
+  /** The open request to set it, if any: pending, or approved and still usable. */
+  request: z
+    .object({
+      id,
+      status: z.enum(["PENDING", "APPROVED"]),
+      ownRequest: z.boolean(),
+      requestedBy: z.string().nullable(),
+      /** Approved requests only: the requester can enter the key until then. */
+      usableUntil: iso.nullable(),
+    })
+    .nullable(),
+});
+export type ApiKeyStatus = z.infer<typeof ApiKeyStatus>;
 
 // ---- Approvals -----------------------------------------------------------------------------
 

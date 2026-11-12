@@ -4,8 +4,7 @@ import Link from "next/link";
 import { notFound } from "next/navigation";
 import { ActionForm } from "@/components/action-form";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
-import { Label } from "@/components/ui/label";
-import { RoleOptions, Select } from "@/components/ui/select";
+import { Notice } from "@/components/ui/notice";
 import { apiGet } from "@/lib/api";
 import { apiAuth, requireSession } from "@/lib/auth";
 import { describeDevice, formatUtc, ROLE_LABELS, timeAgo } from "@/lib/format";
@@ -18,6 +17,7 @@ import {
   revokeUserSessionAction,
   setActiveAction,
 } from "../../actions";
+import { RoleTagFields } from "../role-tag-fields";
 
 export const metadata: Metadata = { title: "Manage person · UlixOps" };
 
@@ -30,6 +30,12 @@ export default async function UserPage({ params }: { params: Promise<{ id: strin
   if (!res?.ok) notFound();
   const { user, sessions } = res.data;
   const self = user.id === me.user.id;
+  const iAmSuper = me.user.role === "SUPER_ADMIN";
+  // Only a Super Admin may change a Super Admin's access (A134); they may also promote an
+  // Admin with 2FA to Super Admin (A172).
+  const targetSuper = user.role === "SUPER_ADMIN";
+  const locked = targetSuper && !iAmSuper;
+  const canEditRole = !self && !locked;
   const status = statusOf(user);
   const hidden = <input type="hidden" name="userId" value={user.id} />;
 
@@ -46,8 +52,13 @@ export default async function UserPage({ params }: { params: Promise<{ id: strin
         {self && <span className="text-xs text-muted-foreground">(you)</span>}
       </div>
       <p className="-mt-2 text-sm text-muted-foreground">
-        {user.email} · {ROLE_LABELS[user.role]} · last sign-in {timeAgo(user.lastLoginAt)}
+        {user.email} · {ROLE_LABELS[user.role]}
+        {user.viewTag ? ` · tag “${user.viewTag}”` : ""} · last sign-in {timeAgo(user.lastLoginAt)}
       </p>
+
+      {locked && (
+        <Notice>Only a Super Admin can change a Super Admin&apos;s access or sessions.</Notice>
+      )}
 
       <div className="grid gap-4 lg:grid-cols-2">
         <Card>
@@ -55,20 +66,36 @@ export default async function UserPage({ params }: { params: Promise<{ id: strin
             <CardTitle className="text-base">Role</CardTitle>
             <CardDescription>
               {self
-                ? "You can't change your own role. Ask another Admin."
-                : "Takes effect on their next click."}
+                ? "You can't change your own role. Ask another Super Admin."
+                : locked
+                  ? "Only a Super Admin can change a Super Admin's role."
+                  : iAmSuper
+                    ? "Super Admin can promote an Admin who has 2FA set up, or demote a Super Admin back to Admin. Every other Admin is alerted."
+                    : "Takes effect on their next click."}
             </CardDescription>
           </CardHeader>
           <CardContent>
-            {!self && (
-              <ActionForm action={changeRoleAction} submitLabel="Save role">
+            {canEditRole && (
+              <ActionForm
+                action={changeRoleAction}
+                submitLabel="Save role"
+                confirm={
+                  iAmSuper
+                    ? {
+                        title: "Change this person's role?",
+                        description:
+                          "Promoting to Super Admin lets them approve their own risky actions. Demoting removes that. Other Admins are alerted.",
+                      }
+                    : undefined
+                }
+              >
                 {hidden}
-                <Label htmlFor="role" className="sr-only">
-                  Role
-                </Label>
-                <Select id="role" name="role" defaultValue={user.role}>
-                  <RoleOptions />
-                </Select>
+                <RoleTagFields
+                  idPrefix="edit"
+                  defaultRole={user.role}
+                  defaultViewTag={user.viewTag}
+                  includeSuperAdmin={iAmSuper}
+                />
               </ActionForm>
             )}
           </CardContent>

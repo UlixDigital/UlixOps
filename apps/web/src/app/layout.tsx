@@ -9,9 +9,13 @@ import "./globals.css";
 const inter = Inter({ subsets: ["latin"], variable: "--font-inter" });
 
 export const metadata: Metadata = {
-  title: "UlixOps",
+  title: "UlixOPS",
   description: "Ulix Digital's secure WordPress operations hub.",
   robots: { index: false, follow: false },
+  icons: {
+    icon: [{ url: "/brand/ulixops-mark.png", type: "image/png" }],
+    apple: [{ url: "/apple-icon.png", type: "image/png" }],
+  },
 };
 
 // Every page renders per request so the CSP nonce from src/proxy.ts reaches every script.

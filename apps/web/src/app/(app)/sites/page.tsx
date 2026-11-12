@@ -1,5 +1,5 @@
-// Spec screen 3: sites list. Plugin updates, vulnerabilities, backups and uptime join this
-// table with the steps that collect them (6, Phase 2, 8, Phase 3); bulk actions with step 10.
+// Spec screen 3: sites list with plugin updates, PHP, vulnerabilities, uptime, connection and
+// health from the steps that collect them.
 import { can, SiteList } from "@ulixops/shared";
 import type { Metadata } from "next";
 import { NoAccess } from "@/components/no-access";

@@ -4,6 +4,7 @@ import {
   type NotificationEvent,
   type NotificationSeverity,
 } from "@ulixops/shared";
+import { raiseAlert } from "../alerts/followup";
 import type { Db } from "../db";
 import type { Prisma } from "../generated/prisma/client";
 import type { Mailer, SlackPoster } from "./channels";
@@ -18,6 +19,11 @@ export interface NotifyInput {
   /** When set, only these users get an in-app row (and email if they are Admins). */
   recipientUserIds?: string[];
   meta?: Record<string, unknown>;
+  /**
+   * Narrows which earlier alert a repeat or an all-clear belongs to inside the same sites
+   * (e.g. the environment id), see A158.
+   */
+  scope?: string;
 }
 
 export interface NotifyDeps {
@@ -32,7 +38,21 @@ export interface NotifyDeps {
 /** Active Admin user ids (notifications that go to "the team"). */
 export async function adminUserIds(db: Db): Promise<string[]> {
   const rows = await db.user.findMany({
-    where: { role: "ADMIN", active: true },
+    where: { role: { in: ["SUPER_ADMIN", "ADMIN"] }, active: true },
+    select: { id: true },
+  });
+  return rows.map((r) => r.id);
+}
+
+/** Drop Client Viewers — they have no notification inbox (A178). */
+async function deliverableUserIds(db: Db, userIds: string[]): Promise<string[]> {
+  if (userIds.length === 0) return [];
+  const rows = await db.user.findMany({
+    where: {
+      id: { in: [...new Set(userIds)] },
+      active: true,
+      role: { not: "CLIENT_VIEWER" },
+    },
     select: { id: true },
   });
   return rows.map((r) => r.id);
@@ -41,7 +61,7 @@ export async function adminUserIds(db: Db): Promise<string[]> {
 async function emailsOf(db: Db, userIds: string[]): Promise<string[]> {
   if (userIds.length === 0) return [];
   const rows = await db.user.findMany({
-    where: { id: { in: userIds }, active: true },
+    where: { id: { in: userIds }, active: true, role: { not: "CLIENT_VIEWER" } },
     select: { email: true },
   });
   return rows.map((r) => r.email);
@@ -54,14 +74,27 @@ async function emailsOf(db: Db, userIds: string[]): Promise<string[]> {
 export async function notify(deps: NotifyDeps, input: NotifyInput): Promise<void> {
   const { db, now } = deps;
   try {
-    const recipients =
+    const candidates =
       input.recipientUserIds && input.recipientUserIds.length > 0
         ? [...new Set(input.recipientUserIds)]
         : await adminUserIds(db);
+    const recipients = await deliverableUserIds(db, candidates);
     if (recipients.length === 0) return;
 
     const at = now();
     const siteIds = input.siteIds ?? [];
+    const alertId = await raiseAlert(
+      db,
+      {
+        kind: input.kind,
+        title: input.title,
+        body: input.body,
+        severity: input.severity,
+        siteIds,
+        scope: input.scope ?? null,
+      },
+      at,
+    );
     await db.notification.createMany({
       data: recipients.map((userId) => ({
         kind: input.kind,
@@ -70,6 +103,7 @@ export async function notify(deps: NotifyDeps, input: NotifyInput): Promise<void
         severity: input.severity,
         userId,
         siteIds,
+        alertId,
         ...(input.meta ? { meta: input.meta as Prisma.InputJsonValue } : {}),
         createdAt: at,
       })),

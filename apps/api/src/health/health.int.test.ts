@@ -145,6 +145,7 @@ describe.runIf(TEST_DATABASE_URL)("site health checks (Postgres)", () => {
       extraPaths: ["/shop/", "/contact/"],
       thresholdMs: 3_000,
       checkErrorLog: false,
+      checkWpAdmin: false,
     });
 
     const view = await as(admin.token).get("/settings").expect(200);
@@ -179,7 +180,8 @@ describe.runIf(TEST_DATABASE_URL)("site health checks (Postgres)", () => {
     expect(jobs).toHaveLength(1);
     expect(jobs[0]).toMatchObject({
       type: "site.health",
-      urls: ["https://shop.example.test/", "https://shop.example.test/wp-admin/"],
+      // Homepage only by default; wp-admin is opt-in (A151).
+      urls: ["https://shop.example.test/"],
       origin: "https://shop.example.test",
       thresholdMs: 5_000,
       checkErrorLog: true,
@@ -252,6 +254,7 @@ describe.runIf(TEST_DATABASE_URL)("site health checks (Postgres)", () => {
         extraPaths: ["/shop/"],
         thresholdMs: 4_000,
         checkErrorLog: false,
+        checkWpAdmin: true,
       })
       .expect(200);
     answer = async () => healthyResult({ thresholdMs: 4_000 });

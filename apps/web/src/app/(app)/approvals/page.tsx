@@ -20,6 +20,8 @@ const ACTION_LABELS: Record<string, string> = {
   "deploy.bulk": "Bulk deployment",
   "site.archive": "Archive site",
   "site.bulk_update": "Bulk plugin/theme update",
+  "site.backup.restore": "Restore from Google Drive backup",
+  "dns.rollback": "Cloudflare DNS rollback",
 };
 
 function Who({ request }: { request: ApprovalView }) {
@@ -107,8 +109,12 @@ export default async function ApprovalsPage() {
                   </span>
                 </div>
                 <p className="text-xs text-muted-foreground">
-                  {request.requestedBy?.email ?? "removed user"} asked · decided by{" "}
-                  {request.decidedBy?.email ?? "UlixOps"}{" "}
+                  {request.requestedBy?.email ?? "removed user"} asked ·{" "}
+                  {request.requestedBy && request.decidedBy?.email === request.requestedBy.email ? (
+                    <span className="font-medium text-warning">self-approved (Super Admin)</span>
+                  ) : (
+                    <>decided by {request.decidedBy?.email ?? "UlixOps"}</>
+                  )}{" "}
                   <span title={formatUtc(request.decidedAt)}>{timeAgo(request.decidedAt)}</span>
                   {request.comment && <> · “{request.comment}”</>}
                 </p>

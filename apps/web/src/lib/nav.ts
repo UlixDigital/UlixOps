@@ -1,4 +1,4 @@
-import { can, type Permission, type RoleName } from "@ulixops/shared";
+import { can, isClientViewer, type Permission, type RoleName } from "@ulixops/shared";
 
 export type NavIcon =
   | "dashboard"
@@ -13,7 +13,8 @@ export type NavIcon =
   | "security"
   | "dns"
   | "monitoring"
-  | "reports";
+  | "reports"
+  | "followup";
 
 export interface NavItem {
   href: string;
@@ -42,21 +43,28 @@ const MAIN: NavItem[] = [
     permission: "notifications.view",
   },
   { href: "/backups", label: "Backups", icon: "backups", permission: "sites.view" },
+  { href: "/security", label: "Security", icon: "security", permission: "sites.view" },
+  { href: "/monitoring", label: "Monitoring", icon: "monitoring", permission: "sites.view" },
+  { href: "/dns", label: "DNS", icon: "dns", permission: "sites.view" },
+  { href: "/reports", label: "Reports", icon: "reports", permission: "dashboard.view" },
   // Not in the spec's sidebar list, but screen 12 needs a home; Admins only (agent decision A48).
   { href: "/approvals", label: "Approvals", icon: "approvals", permission: "approvals.decide" },
   { href: "/audit", label: "Audit log", icon: "audit", permission: "audit.view" },
+  // Super Admin only: who saw each alert, who fixed it and whether the fix held (A158).
+  { href: "/follow-up", label: "Alert follow-up", icon: "followup", permission: "alerts.track" },
   { href: "/settings", label: "Settings", icon: "settings", permission: "settings.manage" },
 ];
 
-const LATER: NavItem[] = [
-  { href: "/security", label: "Security", icon: "security", soon: "Phase 2" },
-  { href: "/dns", label: "DNS", icon: "dns", soon: "Phase 3" },
-  { href: "/monitoring", label: "Monitoring", icon: "monitoring", soon: "Phase 3" },
-  { href: "/reports", label: "Reports", icon: "reports", soon: "Phase 4" },
-];
+/** Client Viewer sidebar (A178): tag-scoped read-only surfaces only. */
+const CLIENT_VIEWER_HREFS = new Set(["/", "/sites", "/security", "/monitoring", "/reports"]);
+
+const LATER: NavItem[] = [];
 
 const visible = (items: NavItem[], role: RoleName) =>
-  items.filter((item) => !item.permission || can(role, item.permission));
+  items.filter((item) => {
+    if (isClientViewer(role)) return CLIENT_VIEWER_HREFS.has(item.href);
+    return !item.permission || can(role, item.permission);
+  });
 
 export function navFor(role: RoleName) {
   return { main: visible(MAIN, role), later: LATER };
@@ -65,8 +73,31 @@ export function navFor(role: RoleName) {
 /** Extra destinations for the command palette. */
 export function paletteLinksFor(role: RoleName): { href: string; label: string; group: string }[] {
   const links = [{ href: "/account", label: "My account", group: "Account" }];
+  if (isClientViewer(role)) {
+    links.push(
+      { href: "/security/malware", label: "Malware scans", group: "Security" },
+      { href: "/security/integrity", label: "File integrity", group: "Security" },
+      { href: "/monitoring/uptime", label: "Uptime", group: "Monitoring" },
+      { href: "/monitoring/ssl", label: "SSL & domain expiry", group: "Monitoring" },
+      { href: "/monitoring/php-errors", label: "PHP errors", group: "Monitoring" },
+      { href: "/reports", label: "Monthly reports", group: "Reports" },
+    );
+    return links;
+  }
   if (can(role, "sites.manage"))
     links.push({ href: "/sites/new", label: "Add site", group: "Sites" });
+  if (can(role, "sites.view")) {
+    links.push({ href: "/security/malware", label: "Malware scans", group: "Security" });
+    links.push({ href: "/security/integrity", label: "File integrity", group: "Security" });
+    links.push({ href: "/backups/full", label: "Full backups (Google Drive)", group: "Backups" });
+    links.push({ href: "/backups/restore", label: "Restore from backup", group: "Backups" });
+    links.push({ href: "/monitoring/uptime", label: "Uptime", group: "Monitoring" });
+    links.push({ href: "/monitoring/ssl", label: "SSL & domain expiry", group: "Monitoring" });
+    links.push({ href: "/monitoring/php-errors", label: "PHP errors", group: "Monitoring" });
+    links.push({ href: "/monitoring/visual", label: "Visual checks", group: "Monitoring" });
+    links.push({ href: "/reports", label: "Monthly reports", group: "Reports" });
+    links.push({ href: "/plugins/scheduled", label: "Scheduled updates", group: "Plugins" });
+  }
   if (can(role, "plugins.upload"))
     links.push({ href: "/plugins/upload", label: "Upload plugin version", group: "Plugins" });
   if (can(role, "deploy.single") || can(role, "deploy.bulk.request"))

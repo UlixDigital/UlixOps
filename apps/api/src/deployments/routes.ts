@@ -5,6 +5,7 @@ import {
   RecordId,
   type CreateDeploymentResponse,
   type DeploymentList,
+  DeploymentListQuery,
   type DeploymentView,
 } from "@ulixops/shared";
 import { type Response, Router } from "express";
@@ -12,7 +13,7 @@ import { audit } from "../audit";
 import type { Db } from "../db";
 import type { Deployment, DeploymentTarget, EnvKind, Site } from "../generated/prisma/client";
 import { authorize, clientIpOf, permitted, sessionOf } from "../http/guard";
-import { emitApprovalRequested } from "../approvals/routes";
+import { emitApprovalRequested, selfApproveIfAllowed } from "../approvals/routes";
 import type { SecurityNotifier } from "../notify";
 import type { RunnerClient } from "../runner/client";
 import type { SnapshotStore } from "../snapshots/store";
@@ -113,10 +114,17 @@ export function deploymentsRouter(deps: DeployDeps): Router {
     return row;
   }
 
-  router.get("/", canView, async (_req, res) => {
+  router.get("/", canView, async (req, res) => {
+    const query = DeploymentListQuery.safeParse(req.query);
+    if (!query.success) {
+      res.status(400).json({ error: "bad_request" });
+      return;
+    }
+    const { siteId, limit } = query.data;
     const rows = await db.deployment.findMany({
+      where: siteId ? { targets: { some: { siteId } } } : {},
       orderBy: { createdAt: "desc" },
-      take: 50,
+      take: limit,
       include,
     });
     const deployments = await Promise.all(rows.map((row) => deploymentView(row)));
@@ -254,13 +262,27 @@ export function deploymentsRouter(deps: DeployDeps): Router {
         },
         now(),
       );
-      await emitApprovalRequested(db, deps.notifier, {
-        requestId: approval.id,
-        action: "deploy.bulk",
-        summary: `Deploy ${version.plugin.slug} ${version.version} to ${productionCount} production sites`,
-        siteIds: body.data.siteIds,
-        requestedById: user.id,
-      });
+      // A Super Admin approves their own bulk deploy at once; other Admins are alerted (A134).
+      const selfApproved = await selfApproveIfAllowed(
+        {
+          db,
+          now,
+          notifier: deps.notifier,
+          onDeployBulkDecided: (decision, deploymentId, decidedById) =>
+            onDeployBulkDecided(orch, decision, deploymentId, decidedById),
+        },
+        approval.id,
+        user,
+        clientIpOf(req),
+      );
+      if (!selfApproved)
+        await emitApprovalRequested(db, deps.notifier, {
+          requestId: approval.id,
+          action: "deploy.bulk",
+          summary: `Deploy ${version.plugin.slug} ${version.version} to ${productionCount} production sites`,
+          siteIds: body.data.siteIds,
+          requestedById: user.id,
+        });
       // Unusual activity: bulk deploy requested outside weekday UTC business hours (A95).
       const hour = now().getUTCHours();
       const weekday = now().getUTCDay(); // 0 Sun … 6 Sat

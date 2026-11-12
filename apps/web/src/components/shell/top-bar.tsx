@@ -2,6 +2,7 @@
 import { LogOut, Menu, Monitor, Moon, Search, Sun, UserRound, X } from "lucide-react";
 import Link from "next/link";
 import { useEffect, useRef, useState } from "react";
+import { BrandLogo } from "@/components/brand-logo";
 import type { NavItem } from "@/lib/nav";
 import { OPEN_PALETTE_EVENT, THEME_COOKIE, THEME_EVENT, type Theme } from "@/lib/ui-prefs";
 import { cn } from "@/lib/utils";
@@ -81,10 +82,10 @@ export function MobileNav({ main, later }: { main: NavItem[]; later: NavItem[] }
       <dialog
         ref={dialog}
         aria-label="Menu"
-        className="m-0 h-dvh max-h-none w-72 max-w-[85vw] bg-sidebar p-0 text-sidebar-foreground backdrop:bg-black/40"
+        className="m-0 h-dvh max-h-none w-72 max-w-[85vw] bg-sidebar-brand p-0 text-sidebar-foreground backdrop:bg-black/40"
       >
-        <div className="flex h-14 items-center justify-between px-4">
-          <span className="text-sm font-semibold">UlixOps</span>
+        <div className="flex h-16 items-center justify-between px-4">
+          <BrandLogo href={null} />
           <button
             type="button"
             onClick={close}

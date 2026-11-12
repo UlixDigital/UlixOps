@@ -2,11 +2,12 @@
 // Site registry. Fields are checked here against the shared schemas so errors can name the
 // field; the API checks everything again (role, approvals) before anything changes.
 import {
+  CoreUpdateResponse,
+  CoreVersion,
   EnvironmentInput,
   EnvKind,
   HostKind,
   InventoryRefreshResponse,
-  Ok,
   HealthCheckResponse,
   BulkUpdateResponse,
   MaintenanceStatusResponse,
@@ -28,6 +29,7 @@ import {
   TestConnectionResponse as TestConnectionSchema,
   UpdateSiteResponse,
 } from "@ulixops/shared";
+import { z } from "zod";
 import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
 import type { ActionState } from "@/components/action-form";
@@ -44,6 +46,9 @@ const FIELD_LABELS: Record<string, string> = {
   wpPath: "WordPress path",
   credentialRef: "SSH key",
 };
+
+/** Risky-action answers: true when a Super Admin approved their own request (A134). */
+const SelfApprovable = z.object({ ok: z.literal(true), selfApproved: z.boolean().optional() });
 
 function field(form: FormData, name: string): string {
   const value = form.get(name);
@@ -192,10 +197,15 @@ export async function updateSiteAction(_prev: ActionState, form: FormData): Prom
     await apiAuth(),
   );
   if (!res.ok) return { error: errorMessage(res.error) };
-  const waiting = res.data.approvalsRequested;
-  await setFlash(
-    waiting.length > 0 ? `Saved. Waiting for another Admin: ${waiting.join(", ")}` : "Saved",
-  );
+  // A Super Admin's changes are self-approved and already applied (A134).
+  const applied = res.data.approvalsRequested.filter((w) => w.includes("self-approved"));
+  const waiting = res.data.approvalsRequested.filter((w) => !w.includes("self-approved"));
+  const parts = [
+    "Saved.",
+    ...(applied.length > 0 ? [`Applied: ${applied.join(", ")}.`] : []),
+    ...(waiting.length > 0 ? [`Waiting for another Admin: ${waiting.join(", ")}.`] : []),
+  ];
+  await setFlash(parts.join(" "));
   revalidatePath(`/sites/${id}`);
   redirect(`/sites/${id}`);
 }
@@ -208,12 +218,16 @@ export async function setArchivedAction(_prev: ActionState, form: FormData): Pro
     "POST",
     `/sites/${id}/${archive ? "archive" : "restore"}`,
     {},
-    Ok,
+    SelfApprovable,
     await apiAuth(),
   );
   if (!res.ok) return { error: errorMessage(res.error) };
   await setFlash(
-    archive ? "Archive requested — another Admin must approve it on Approvals." : "Site restored",
+    !archive
+      ? "Site restored"
+      : res.data.selfApproved
+        ? "Site archived (self-approved; the other Admins were notified)."
+        : "Archive requested — another Admin must approve it on Approvals.",
   );
   revalidatePath("/sites");
   revalidatePath(`/sites/${id}`);
@@ -252,16 +266,48 @@ export async function resetHostKeyAction(_prev: ActionState, form: FormData): Pr
     "POST",
     `/sites/${id}/environments/${kind.data.toLowerCase()}/host-key/reset`,
     {},
-    Ok,
+    SelfApprovable,
     await apiAuth(),
   );
   if (!res.ok) return { error: errorMessage(res.error) };
-  await setFlash("Requested. Another Admin must approve it on the Approvals page.");
+  await setFlash(
+    res.data.selfApproved
+      ? "Host key forgotten (self-approved). Run Test connection to pin the current one."
+      : "Requested. Another Admin must approve it on the Approvals page.",
+  );
   revalidatePath(`/sites/${id}`);
   return {};
 }
 
 /** Toast for a finished job, or an inline error that points at the job log. */
+/**
+ * Cloudflare drops a page request after about 100 s, while snapshot + update + health can take
+ * minutes (A136). Long actions wait at most this long; the work then carries on in the
+ * background and the site's "working on" banner refreshes the page when it ends.
+ */
+const BROWSER_WAIT_MS = 60_000;
+
+/** The result if it arrives in time, else null (the call keeps running server-side). */
+async function settle<T>(work: Promise<T>): Promise<T | null> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const late = new Promise<null>((resolve) => {
+    timer = setTimeout(() => resolve(null), BROWSER_WAIT_MS);
+  });
+  try {
+    return await Promise.race([work, late]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function stillRunning(id: string, what: string): Promise<ActionState> {
+  await setFlash(
+    `${what} is still running in the background. This page updates when it finishes; the result is also under Logs.`,
+  );
+  revalidatePath(`/sites/${id}`, "layout");
+  return {};
+}
+
 async function reportJob(id: string, job: SiteJobView, hostKeyMismatch: boolean) {
   revalidatePath(`/sites/${id}`, "layout");
   if (job.status === "SUCCEEDED") {
@@ -290,15 +336,18 @@ export async function refreshInventoryAction(
   const kind = EnvKind.safeParse(field(form, "kind"));
   if (!id || !kind.success) return { error: errorMessage("not_found") };
   const checkUpdates = field(form, "checkUpdates") === "true";
-  const res = await apiSend(
-    "POST",
-    `/sites/${id}/environments/${kind.data.toLowerCase()}/inventory`,
-    { checkUpdates },
-    InventoryRefreshResponse,
-    await apiAuth(),
-    // API waits up to 180 s; web budget is a little higher (A114).
-    { timeoutMs: 200_000 },
+  const res = await settle(
+    apiSend(
+      "POST",
+      `/sites/${id}/environments/${kind.data.toLowerCase()}/inventory`,
+      { checkUpdates },
+      InventoryRefreshResponse,
+      await apiAuth(),
+      // API waits up to 180 s; web budget is a little higher (A114).
+      { timeoutMs: 200_000 },
+    ),
   );
+  if (!res) return stillRunning(id, checkUpdates ? "Check for updates" : "Refresh inventory");
   if (!res.ok) return { error: errorMessage(res.error) };
   return reportJob(id, res.data.job, res.data.hostKeyMismatch);
 }
@@ -469,17 +518,21 @@ export async function updatePluginAction(_prev: ActionState, form: FormData): Pr
         "Enter the plugin's folder name as WP-CLI shows it (letters, digits, -, _ and .), e.g. akismet.",
     };
   }
-  const res = await apiSend(
-    "POST",
-    `/sites/${id}/environments/${kind.data.toLowerCase()}/plugins/update`,
-    {
-      plugin: plugin.data,
-      ...(form.has("includeDb") ? { includeDb: field(form, "includeDb") === "true" } : {}),
-    },
-    PluginUpdateResponse,
-    await apiAuth(),
-    { timeoutMs: 320_000 },
+  const res = await settle(
+    apiSend(
+      "POST",
+      `/sites/${id}/environments/${kind.data.toLowerCase()}/plugins/update`,
+      {
+        plugin: plugin.data,
+        ...(form.has("includeDb") ? { includeDb: field(form, "includeDb") === "true" } : {}),
+      },
+      PluginUpdateResponse,
+      await apiAuth(),
+      // Snapshot (≤180s) + plugin.update SSH (≤300s) + API wait headroom (A131).
+      { timeoutMs: 540_000 },
+    ),
   );
+  if (!res) return stillRunning(id, `Update plugin ${plugin.data}`);
   if (!res.ok) return { error: errorMessage(res.error) };
   revalidatePath("/backups");
   revalidatePath(`/sites/${id}/plugins`);
@@ -501,17 +554,21 @@ export async function updateThemeAction(_prev: ActionState, form: FormData): Pro
         "Enter the theme's folder name as WP-CLI shows it (letters, digits, -, _ and .), e.g. twentytwentyfive.",
     };
   }
-  const res = await apiSend(
-    "POST",
-    `/sites/${id}/environments/${kind.data.toLowerCase()}/themes/update`,
-    {
-      theme: theme.data,
-      ...(form.has("includeDb") ? { includeDb: field(form, "includeDb") === "true" } : {}),
-    },
-    ThemeUpdateResponse,
-    await apiAuth(),
-    { timeoutMs: 320_000 },
+  const res = await settle(
+    apiSend(
+      "POST",
+      `/sites/${id}/environments/${kind.data.toLowerCase()}/themes/update`,
+      {
+        theme: theme.data,
+        ...(form.has("includeDb") ? { includeDb: field(form, "includeDb") === "true" } : {}),
+      },
+      ThemeUpdateResponse,
+      await apiAuth(),
+      // Snapshot (≤180s) + theme.update SSH (≤300s) + API wait headroom (A131).
+      { timeoutMs: 540_000 },
+    ),
   );
+  if (!res) return stillRunning(id, `Update theme ${theme.data}`);
   if (!res.ok) return { error: errorMessage(res.error) };
   revalidatePath("/backups");
   revalidatePath(`/sites/${id}/plugins`);
@@ -519,6 +576,119 @@ export async function updateThemeAction(_prev: ActionState, form: FormData): Pro
     return reportJob(id, res.data.updateJob, res.data.hostKeyMismatch);
   }
   return reportJob(id, res.data.job, res.data.hostKeyMismatch);
+}
+
+/** WordPress core: update → database upgrade → health → automatic rollback (A135). */
+export async function updateCoreAction(_prev: ActionState, form: FormData): Promise<ActionState> {
+  const id = siteId(form);
+  const kind = EnvKind.safeParse(field(form, "kind"));
+  const version = CoreVersion.safeParse(field(form, "version"));
+  if (!id || !kind.success) return { error: errorMessage("not_found") };
+  const stale = "The offered WordPress version changed. Run Check for updates, then try again.";
+  if (!version.success) return { error: stale };
+  const res = await settle(
+    apiSend(
+      "POST",
+      `/sites/${id}/environments/${kind.data.toLowerCase()}/core/update`,
+      { version: version.data },
+      CoreUpdateResponse,
+      await apiAuth(),
+      // Core update (≤300s) + update-db (≤300s) + health, rollback and inventory headroom.
+      { timeoutMs: 1_200_000 },
+    ),
+  );
+  if (!res) return stillRunning(id, `Update WordPress to ${version.data}`);
+  if (!res.ok) return { error: res.error === "out_of_date" ? stale : errorMessage(res.error) };
+  revalidatePath(`/sites/${id}`);
+  revalidatePath(`/sites/${id}/plugins`);
+  revalidatePath(`/sites/${id}/logs`);
+  const { status, fromVersion, toVersion, detail } = res.data;
+  if (status === "updated") {
+    await setFlash(`WordPress updated ${fromVersion} → ${toVersion}. The site is healthy.`);
+    return {};
+  }
+  return {
+    error:
+      status === "rolled_back"
+        ? `Rolled back to WordPress ${fromVersion}: ${detail}`
+        : status === "failed"
+          ? `WordPress was not updated: ${detail}`
+          : `Needs attention now: ${detail}`,
+  };
+}
+
+/** Start a malware scan of one environment; it runs in the background (A138, A140). */
+export async function startMalwareScanAction(
+  _prev: ActionState,
+  form: FormData,
+): Promise<ActionState> {
+  const id = siteId(form);
+  const kind = EnvKind.safeParse(field(form, "kind"));
+  if (!id || !kind.success) return { error: errorMessage("not_found") };
+  const res = await apiSend(
+    "POST",
+    `/sites/${id}/environments/${kind.data.toLowerCase()}/malware-scan`,
+    {},
+    z.object({ scanId: RecordId, position: z.number().int() }),
+    await apiAuth(),
+  );
+  if (!res.ok) return { error: errorMessage(res.error) };
+  const ahead = res.data.position - 1;
+  await setFlash(
+    ahead <= 0
+      ? "Malware scan started. Copying and scanning a site takes a few minutes; the page updates as it goes."
+      : `Malware scan queued: ${ahead} scan${ahead === 1 ? "" : "s"} ahead of it. It starts on its own (one at a time).`,
+  );
+  revalidatePath(`/sites/${id}/security`);
+  revalidatePath("/security");
+  revalidatePath("/security/malware");
+  return {};
+}
+
+/** Snapshot an inactive plugin's or theme's folder, then delete it (A137). */
+export async function deleteAssetAction(_prev: ActionState, form: FormData): Promise<ActionState> {
+  const id = siteId(form);
+  const kind = EnvKind.safeParse(field(form, "kind"));
+  const asset = field(form, "asset") === "theme" ? "theme" : "plugin";
+  const name = (asset === "theme" ? ThemeName : PluginName).safeParse(field(form, "name"));
+  if (!id || !kind.success || !name.success) return { error: errorMessage("not_found") };
+  const res = await settle(
+    apiSend(
+      "POST",
+      `/sites/${id}/environments/${kind.data.toLowerCase()}/${asset}s/delete`,
+      asset === "theme" ? { theme: name.data } : { plugin: name.data },
+      PluginUpdateResponse,
+      await apiAuth(),
+      // Snapshot (≤180s) + delete + inventory re-read (≤180s).
+      { timeoutMs: 420_000 },
+    ),
+  );
+  if (!res) return stillRunning(id, `Delete ${asset} ${name.data}`);
+  if (!res.ok) return { error: errorMessage(res.error) };
+  revalidatePath("/backups");
+  revalidatePath(`/sites/${id}/plugins`);
+  revalidatePath(`/sites/${id}/snapshots`);
+  return reportJob(id, res.data.updateJob ?? res.data.job, res.data.hostKeyMismatch);
+}
+
+/** Hide the last finished bulk update report (A136). */
+export async function dismissBulkReportAction(
+  _prev: ActionState,
+  form: FormData,
+): Promise<ActionState> {
+  const id = siteId(form);
+  const kind = EnvKind.safeParse(field(form, "kind"));
+  if (!id || !kind.success) return { error: errorMessage("not_found") };
+  const res = await apiSend(
+    "POST",
+    `/sites/${id}/environments/${kind.data.toLowerCase()}/bulk-update/dismiss`,
+    {},
+    SelfApprovable,
+    await apiAuth(),
+  );
+  if (!res.ok) return { error: errorMessage(res.error) };
+  revalidatePath(`/sites/${id}/plugins`);
+  return {};
 }
 
 /** Snapshot each outdated plugin/theme, update, then refresh inventory (A104 / A108). */
@@ -543,15 +713,18 @@ export async function bulkUpdateAction(_prev: ActionState, form: FormData): Prom
     }
   }
 
-  const res = await apiSend(
-    "POST",
-    `/sites/${id}/environments/${kind.data.toLowerCase()}/bulk-update`,
-    { strategy, ...(items !== undefined ? { items } : {}) },
-    BulkUpdateResponse,
-    await apiAuth(),
-    // Approval path returns quickly; immediate runs can take a long time (A108).
-    { timeoutMs: 900_000 },
+  const res = await settle(
+    apiSend(
+      "POST",
+      `/sites/${id}/environments/${kind.data.toLowerCase()}/bulk-update`,
+      { strategy, ...(items !== undefined ? { items } : {}) },
+      BulkUpdateResponse,
+      await apiAuth(),
+      // Approval path returns quickly; immediate runs can take a long time (A108).
+      { timeoutMs: 900_000 },
+    ),
   );
+  if (!res) return stillRunning(id, "The bulk update");
   if (!res.ok) return { error: errorMessage(res.error) };
   revalidatePath("/backups");
   revalidatePath(`/sites/${id}/plugins`);
@@ -559,6 +732,12 @@ export async function bulkUpdateAction(_prev: ActionState, form: FormData): Prom
   if (res.data.status === "pending_approval") {
     await setFlash(
       "Bulk update submitted — waiting for another Admin on Approvals. You will be notified when it finishes.",
+    );
+    redirect(pluginsPath);
+  }
+  if (res.data.status === "running") {
+    await setFlash(
+      "Bulk update self-approved and started (the other Admins were notified). You will be notified when it finishes.",
     );
     redirect(pluginsPath);
   }

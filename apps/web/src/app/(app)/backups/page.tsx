@@ -1,4 +1,4 @@
-// Spec screen 13 (P1): quick snapshots across all sites. Full backups arrive in Phase 2.
+// Spec screen 13 (P1): quick snapshots across all sites. Full backups: ./full (A145).
 import { BackupList } from "@ulixops/shared";
 import type { Metadata } from "next";
 import Link from "next/link";
@@ -8,6 +8,7 @@ import { Notice } from "@/components/ui/notice";
 import { apiGet } from "@/lib/api";
 import { apiAuth, requireSession } from "@/lib/auth";
 import { formatUtc, timeAgo } from "@/lib/format";
+import { BackupsTabs } from "./backups-tabs";
 
 export const metadata: Metadata = { title: "Backups · UlixOps" };
 
@@ -27,10 +28,11 @@ export default async function BackupsPage() {
       <div>
         <h1 className="text-xl font-semibold tracking-tight">Backups & snapshots</h1>
         <p className="text-sm text-muted-foreground">
-          Quick pre-update snapshots of a plugin folder (encrypted, with retention). Scheduled full
-          backups to Google Drive arrive in Phase 2.
+          Quick pre-update snapshots of a plugin folder (encrypted, with retention). Weekly full
+          backups of every site are under Full backups.
         </p>
       </div>
+      <BackupsTabs active="/backups" />
 
       {!res.ok && (
         <Notice tone="error">Snapshots couldn&apos;t be loaded. Refresh the page.</Notice>

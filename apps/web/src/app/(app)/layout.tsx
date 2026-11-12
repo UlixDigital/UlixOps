@@ -1,10 +1,13 @@
+import { can, isClientViewer, NotificationList } from "@ulixops/shared";
 import { cookies } from "next/headers";
 import type { ReactNode } from "react";
 import { CommandPalette } from "@/components/shell/command-palette";
+import { NotificationBell } from "@/components/shell/notification-bell";
 import { Sidebar } from "@/components/shell/sidebar";
 import { MobileNav, SearchButton, ThemeToggle, UserMenu } from "@/components/shell/top-bar";
 import { Toaster } from "@/components/toaster";
-import { requireSession } from "@/lib/auth";
+import { apiGet } from "@/lib/api";
+import { apiAuth, requireSession } from "@/lib/auth";
 import { readFlash } from "@/lib/flash";
 import { ROLE_LABELS } from "@/lib/format";
 import { navFor, paletteLinksFor } from "@/lib/nav";
@@ -16,6 +19,11 @@ export default async function AppLayout({ children }: Readonly<{ children: React
   const { user } = await requireSession();
   const jar = await cookies();
   const { main, later } = navFor(user.role);
+  // Unread alerts for the bell and its popups (A158); Client Viewer has no inbox (A178).
+  const showBell = can(user.role, "notifications.view") && !isClientViewer(user.role);
+  const bell = showBell
+    ? await apiGet("/notifications?limit=8&unread=1", NotificationList, await apiAuth())
+    : null;
   const paletteLinks = [
     ...main
       .filter((item) => !item.soon)
@@ -36,6 +44,7 @@ export default async function AppLayout({ children }: Readonly<{ children: React
           <div className="flex flex-1">
             <SearchButton />
           </div>
+          {bell && <NotificationBell initial={bell.ok ? bell.data : null} />}
           <ThemeToggle initial={parseTheme(jar.get(THEME_COOKIE)?.value)} />
           <UserMenu
             email={user.email}
@@ -44,7 +53,7 @@ export default async function AppLayout({ children }: Readonly<{ children: React
             signOut={logoutAction}
           />
         </header>
-        <main className="mx-auto w-full max-w-6xl flex-1 p-4 md:p-6">{children}</main>
+        <main className="mx-auto w-full max-w-6xl min-w-0 flex-1 p-4 md:p-6">{children}</main>
       </div>
       <CommandPalette links={paletteLinks} signOut={logoutAction} />
       <Toaster message={await readFlash()} />

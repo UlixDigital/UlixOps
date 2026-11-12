@@ -25,6 +25,12 @@ const Env = z.object({
     .regex(/^\/[A-Za-z0-9._/-]{0,250}$/, "an absolute path")
     .refine((p) => !p.includes(".."), "an absolute path without ..")
     .default("/data/snapshots"),
+  /** Before/after PNGs from the Playwright sidecar (A163); shared with the runner. */
+  VISUAL_STORE_DIR: z
+    .string()
+    .regex(/^\/[A-Za-z0-9._/-]{0,250}$/, "an absolute path")
+    .refine((p) => !p.includes(".."), "an absolute path without ..")
+    .default("/data/visual"),
   /** Default retention when Settings has no override (spec §6.5). */
   SNAPSHOT_RETENTION_DAYS: z.coerce.number().int().min(1).max(90).default(7),
   ...Database,

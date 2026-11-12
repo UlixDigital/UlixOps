@@ -8,7 +8,10 @@ const FILTERS = ["action", "email", "result", "from", "to"];
 /** Streams the CSV from the internal API to the browser (which cannot reach the API itself). */
 export async function GET(request: NextRequest) {
   const state = await readSession();
-  if (state.status !== "valid") return NextResponse.redirect(new URL("/login", request.url));
+  if (state.status !== "valid") {
+    // Relative: behind the tunnel request.url is the container's address (0.0.0.0:3000).
+    return new NextResponse(null, { status: 303, headers: { location: "/login" } });
+  }
   if (!can(state.session.user.role, "audit.view")) {
     return new NextResponse("Forbidden", { status: 403 });
   }

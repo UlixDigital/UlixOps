@@ -9,7 +9,7 @@ Hard rules. If one blocks you, stop and ask; never weaken it to make something w
 5. Secrets never appear in code, commits, logs, job data, job results, API responses or the frontend. Store a vault reference (`credentialRef`), never the secret. Redact command output before it leaves the runner.
 6. SSH key auth only. Plain FTP is last resort: Admin-only to enable, flagged "insecure connection" in the UI.
 7. Every mutating action writes an `AuditLog` row (who, what, sites, when, IP, result). Never update or delete audit rows.
-8. Bulk, all-sites, site deletion and credential changes need an approved `ApprovalRequest` decided by a different Admin than the requester.
+8. Bulk, all-sites, site deletion and credential changes need an approved `ApprovalRequest` decided by a different Admin than the requester. Owner-approved exception (A134): a **Super Admin** self-approves; that is still an `ApprovalRequest`, audited as `approval.self_approve`, and alerts every other Admin. Super Admin is granted by CLI (`grant-super-admin`) or by an existing Super Admin promoting an Admin who has 2FA (A172); never inviteable as Super Admin; regular Admins cannot assign it.
 9. Cookies: `Secure`, `HttpOnly`, `SameSite=Strict`. Sessions: 30 min idle, 12 h absolute. 2FA mandatory for every user.
 10. Keep the CSP strict (nonce scripts, no `unsafe-inline` scripts, `frame-ancestors 'none'`) and security headers on every response.
 11. Containers: non-root, read-only root filesystem, `cap_drop: ALL`, `no-new-privileges`, only the networks they need. Only `web` publishes a port.

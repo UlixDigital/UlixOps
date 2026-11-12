@@ -1,3 +1,4 @@
+import { observeAlerts, type ObserveInput } from "./alerts/followup";
 import type { Db } from "./db";
 import type { Mailer, SlackPoster } from "./notifications/channels";
 import { adminUserIds, notify, type NotifyInput } from "./notifications/dispatch";
@@ -19,6 +20,11 @@ export interface SecurityNotifier {
   alert(event: SecurityAlertEvent): Promise<void>;
   /** Optional: operational events (deploy / approval). Hub notifier always implements this. */
   notify?(input: NotifyInput): Promise<void>;
+  /**
+   * Optional: a later check on a problem that was alerted (clean or still failing), so the
+   * alert follow-up can confirm or reject a reported fix (A158).
+   */
+  observe?(input: ObserveInput): Promise<void>;
 }
 
 /**
@@ -43,6 +49,9 @@ export function createHubNotifier(deps: {
   return {
     async notify(input) {
       await notify(channels, input);
+    },
+    async observe(input) {
+      await observeAlerts(deps.db, input, deps.now());
     },
     async alert(event) {
       console.warn(
@@ -77,6 +86,7 @@ export function createHubNotifier(deps: {
         severity,
         recipientUserIds: await adminUserIds(deps.db),
         meta: { subjectUserId: event.userId, ip: event.ip },
+        scope: event.userId,
       });
     },
   };

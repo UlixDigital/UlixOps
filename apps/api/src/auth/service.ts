@@ -205,7 +205,14 @@ export class AuthService {
 
   // ---- Sessions -------------------------------------------------------------------------
 
-  async validateSession(sessionToken: string): Promise<Result<SessionInfo>> {
+  /**
+   * `touch: false` checks without extending the idle timer: background polling (the
+   * notification bell) must not keep an unattended session alive (A158).
+   */
+  async validateSession(
+    sessionToken: string,
+    opts: { touch?: boolean } = {},
+  ): Promise<Result<SessionInfo>> {
     const { db } = this.deps;
     const now = this.deps.now();
     const session = await db.session.findUnique({
@@ -228,14 +235,14 @@ export class AuthService {
     }
 
     let lastSeen = session.lastSeenAt;
-    if (now.getTime() - lastSeen.getTime() >= POLICY.touchMs) {
+    if (opts.touch !== false && now.getTime() - lastSeen.getTime() >= POLICY.touchMs) {
       await db.session.update({ where: { id: session.id }, data: { lastSeenAt: now } });
       lastSeen = now;
     }
     const idleExpiresAt = Math.min(lastSeen.getTime() + POLICY.idleMs, session.expiresAt.getTime());
-    const { id, email, name, role } = session.user;
+    const { id, email, name, role, viewTag } = session.user;
     return ok({
-      user: { id, email, name, role },
+      user: { id, email, name, role, viewTag },
       sessionId: session.id,
       expiresAt: session.expiresAt.toISOString(),
       idleExpiresAt: new Date(idleExpiresAt).toISOString(),

@@ -3,11 +3,13 @@ import {
   BulkUpdateStatusResponse,
   can,
   InventoryResponse,
+  isClientViewer,
   siteActionPermission,
   versionJumpSafety,
   type BulkUpdatePlanItem,
 } from "@ulixops/shared";
 import type { Metadata } from "next";
+import { NoAccess } from "@/components/no-access";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Notice } from "@/components/ui/notice";
 import { apiGet } from "@/lib/api";
@@ -16,8 +18,10 @@ import { formatUtc, timeAgo } from "@/lib/format";
 import { loadSite, pickEnvironment } from "@/lib/site";
 import { ENV_LABELS } from "@/lib/site-status";
 import { CheckInventoryUpdates, EnvSwitcher, RefreshInventory, remoteBlocker } from "../parts";
+import { AutoUpdateCard } from "./auto-update-card";
 import { BulkUpdateForm } from "./bulk-update-form";
 import { BulkUpdateProgress } from "./bulk-update-progress";
+import { CoreCard } from "./core-card";
 import { PluginsTable, ThemesTable } from "./inventory-tables";
 
 export const metadata: Metadata = { title: "Plugins & themes · UlixOps" };
@@ -30,6 +34,9 @@ export default async function PluginsPage({
   searchParams: Promise<{ env?: string | string[] }>;
 }) {
   const { user } = await requireSession();
+  if (isClientViewer(user.role)) {
+    return <NoAccess role={user.role} what="plugins & themes" />;
+  }
   const site = await loadSite((await params).id);
   const env = pickEnvironment(site, (await searchParams).env);
   const auth = await apiAuth();
@@ -91,6 +98,14 @@ export default async function PluginsPage({
                   {timeAgo(inventory.refreshedAt)}
                 </span>
                 {inventory.refreshedBy && ` by ${inventory.refreshedBy.email}`}
+                {" · "}
+                {inventory.updatesCheckedAt ? (
+                  <span title={formatUtc(inventory.updatesCheckedAt)}>
+                    updates checked {timeAgo(inventory.updatesCheckedAt)}
+                  </span>
+                ) : (
+                  "updates not checked yet"
+                )}
               </>
             ) : (
               `${ENV_LABELS[env.kind]}: no inventory yet`
@@ -130,8 +145,25 @@ export default async function PluginsPage({
       )}
 
       {bulkStatus && (
-        <BulkUpdateProgress status={bulkStatus} siteId={site.id} envQuery={envQuery} />
+        <BulkUpdateProgress
+          status={bulkStatus}
+          siteId={site.id}
+          envQuery={envQuery}
+          canDismiss={can(user.role, "sites.refresh")}
+        />
       )}
+
+      <AutoUpdateCard
+        siteId={site.id}
+        siteName={site.name}
+        installed={[
+          ...(inventory?.plugins ?? [])
+            .filter((p) => p.status !== "must-use" && p.status !== "dropin")
+            .map((p) => ({ asset: "plugin" as const, name: p.name })),
+          ...(inventory?.themes ?? []).map((t) => ({ asset: "theme" as const, name: t.name })),
+        ]}
+        canManage={can(user.role, "sites.manage")}
+      />
 
       {!inventory ? (
         <Card>
@@ -145,6 +177,14 @@ export default async function PluginsPage({
         </Card>
       ) : (
         <>
+          <CoreCard
+            siteId={site.id}
+            kind={env.kind}
+            wpVersion={inventory.wpVersion}
+            coreUpdateVersion={inventory.coreUpdateVersion ?? null}
+            wpEngine={site.host === "WPENGINE"}
+            canUpdate={actions && can(user.role, siteActionPermission("core.update", env.kind))}
+          />
           {canBulk && (
             <Card>
               <CardHeader>
@@ -188,6 +228,10 @@ export default async function PluginsPage({
                 canDeactivate={
                   actions && can(user.role, siteActionPermission("plugin.deactivate", env.kind))
                 }
+                canDelete={
+                  actions && can(user.role, siteActionPermission("plugin.delete", env.kind))
+                }
+                updatesChecked={Boolean(inventory.updatesCheckedAt)}
                 canUpdate={
                   actions && can(user.role, siteActionPermission("plugin.update", env.kind))
                 }
@@ -210,6 +254,10 @@ export default async function PluginsPage({
                 canUpdate={
                   actions && can(user.role, siteActionPermission("theme.update", env.kind))
                 }
+                canDelete={
+                  actions && can(user.role, siteActionPermission("theme.delete", env.kind))
+                }
+                updatesChecked={Boolean(inventory.updatesCheckedAt)}
               />
             </CardContent>
           </Card>

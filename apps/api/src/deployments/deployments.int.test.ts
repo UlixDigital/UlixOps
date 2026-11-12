@@ -12,8 +12,10 @@ import { LoginGuard, MemoryCounter } from "../auth/limits";
 import { AuthService } from "../auth/service";
 import { createPrisma } from "../db";
 import { PluginStore } from "../plugins/store";
+import type { NotifyInput } from "../notifications/dispatch";
 import type { RunnerClient } from "../runner/client";
 import { SnapshotStore } from "../snapshots/store";
+import { recoverInterruptedDeployments } from "./orchestrator";
 
 const SECRET = "s".repeat(64);
 const NOW = new Date(Date.UTC(2026, 9, 30, 12, 0, 0));
@@ -115,7 +117,7 @@ describe.runIf(TEST_DATABASE_URL)("deployments (Postgres)", () => {
           .send(zip),
     };
   };
-  const make = (role: "ADMIN" | "DEVELOPER" | "VIEWER", email?: string) =>
+  const make = (role: "SUPER_ADMIN" | "ADMIN" | "DEVELOPER" | "VIEWER", email?: string) =>
     userWithSession(db, role, { sessionSecret: SECRET, now: NOW, ...(email ? { email } : {}) });
 
   async function publish(token: string) {
@@ -248,6 +250,46 @@ describe.runIf(TEST_DATABASE_URL)("deployments (Postgres)", () => {
     });
     expect(row.approvedById).toBe(approver.user.id);
     expect(jobs.filter((j) => j.type === "site.plugin.deploy")).toHaveLength(2);
+
+    // A site's Deployments tab: only rollouts that touched that site.
+    const other = await addSite(approver.token, "Gamma", "https://c.example.test");
+    const forA = await as(requester.token).get(`/deployments?siteId=${a}&limit=1`).expect(200);
+    expect(forA.body.deployments.map((d: { id: string }) => d.id)).toEqual([
+      created.body.deployment.id,
+    ]);
+    const forOther = await as(requester.token).get(`/deployments?siteId=${other}`).expect(200);
+    expect(forOther.body.deployments).toEqual([]);
+    await as(requester.token).get("/deployments?siteId=Not-An-Id!").expect(400);
+    await as(requester.token).get("/deployments?limit=500").expect(400);
+  });
+
+  it("starts a Super Admin's bulk deploy at once, self-approved (A134)", async () => {
+    const boss = await make("SUPER_ADMIN", "boss@example.test");
+    await make("ADMIN", "other@example.test");
+    const plugin = await publish(boss.token);
+    const a = await addSite(boss.token, "Alpha", "https://a.example.test");
+    const b = await addSite(boss.token, "Beta", "https://b.example.test");
+
+    const created = await as(boss.token)
+      .post("/deployments", {
+        pluginSlug: plugin.slug,
+        version: plugin.version,
+        siteIds: [a, b],
+        stagingFirst: false,
+        batchSize: 2,
+      })
+      .expect(201);
+    expect(created.body.approvalId).toMatch(/^[a-z0-9]+$/);
+    expect(created.body.deployment.status).not.toBe("PENDING_APPROVAL");
+
+    await waitFor(created.body.deployment.id, "SUCCEEDED");
+    const row = await db.deployment.findUniqueOrThrow({
+      where: { id: created.body.deployment.id },
+    });
+    expect(row.approvedById).toBe(boss.user.id);
+    expect(
+      await db.approvalRequest.findUniqueOrThrow({ where: { id: created.body.approvalId } }),
+    ).toMatchObject({ status: "APPROVED", decidedById: boss.user.id });
   });
 
   it("rolls back and pauses when health fails after deploy", async () => {
@@ -282,6 +324,85 @@ describe.runIf(TEST_DATABASE_URL)("deployments (Postgres)", () => {
       "site.health",
       "site.snapshot.restore",
     ]);
+  });
+
+  it("pauses rollouts a hub restart stranded and resumes them on request (A155)", async () => {
+    const requester = await make("DEVELOPER", "dev@example.test");
+    const admin = await make("ADMIN", "admin@example.test");
+    const plugin = await publish(admin.token);
+    const a = await addSite(admin.token, "Alpha", "https://a.example.test");
+    const b = await addSite(admin.token, "Beta", "https://b.example.test");
+    const created = await as(requester.token)
+      .post("/deployments", {
+        pluginSlug: plugin.slug,
+        version: plugin.version,
+        siteIds: [a, b],
+        stagingFirst: false,
+        batchSize: 1,
+      })
+      .expect(201);
+    const id = created.body.deployment.id as string;
+    // What a restart leaves behind: RUNNING with one target mid-deploy, the next still queued.
+    await db.deployment.update({ where: { id }, data: { status: "RUNNING", startedAt: NOW } });
+    const targets = await db.deploymentTarget.findMany({
+      where: { deploymentId: id },
+      orderBy: { id: "asc" },
+    });
+    await db.deploymentTarget.update({
+      where: { id: targets[0]!.id },
+      data: {
+        status: "DEPLOYING",
+        log: "Snapshot ready (x).\nDeploying plugin ZIP…",
+        backupId: "x",
+      },
+    });
+    await db.backup.create({
+      data: {
+        siteId: targets[0]!.siteId,
+        environmentId: targets[0]!.environmentId,
+        kind: "QUICK_SNAPSHOT",
+        status: "PENDING",
+        location: "pending",
+        encrypted: true,
+        expiresAt: NOW,
+        createdAt: NOW,
+      },
+    });
+
+    const sent: NotifyInput[] = [];
+    const count = await recoverInterruptedDeployments({
+      db,
+      now,
+      notifier: { alert: async () => {}, notify: async (input) => void sent.push(input) },
+    });
+    expect(count).toBe(1);
+    expect(jobs).toEqual([]);
+    expect((await db.deployment.findUniqueOrThrow({ where: { id } })).status).toBe("PAUSED");
+    const after = await db.deploymentTarget.findMany({
+      where: { deploymentId: id },
+      orderBy: { id: "asc" },
+    });
+    expect(after.map((t) => t.status)).toEqual(["PAUSED", "PAUSED"]);
+    expect(after[0]!.log).toMatch(/Deploying plugin ZIP…\nInterrupted by a hub restart/);
+    expect(after[0]!.log).toMatch(/pre-deploy snapshot is in Backups/);
+    expect(await db.backup.count({ where: { status: "PENDING" } })).toBe(0);
+    const row = await db.auditLog.findFirstOrThrow({ where: { action: "deployment.interrupted" } });
+    expect(row).toMatchObject({ result: "alert", userId: null });
+    expect(row.siteIds.sort()).toEqual([a, b].sort());
+    expect(sent).toHaveLength(1);
+    expect(sent[0]).toMatchObject({ severity: "critical", siteIds: [targets[0]!.siteId] });
+    expect(sent[0]!.recipientUserIds).toEqual(
+      expect.arrayContaining([admin.user.id, requester.user.id]),
+    );
+
+    // Idempotent: a second restart finds nothing to do.
+    expect(await recoverInterruptedDeployments({ db, now })).toBe(0);
+
+    await as(admin.token).post(`/deployments/${id}/resume`).expect(200);
+    await waitFor(id, "SUCCEEDED");
+    const done = await db.deploymentTarget.findUniqueOrThrow({ where: { id: targets[0]!.id } });
+    expect(done.status).toBe("DONE");
+    expect(done.log).toMatch(/Interrupted by a hub restart[\s\S]*Resumed\.[\s\S]*Healthy\. Done\./);
   });
 
   it("refuses viewers creating deploys and untested connections", async () => {

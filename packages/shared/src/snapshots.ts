@@ -1,6 +1,6 @@
 // Quick pre-update snapshots (Build Order step 8, spec §6.5).
 import { z } from "zod";
-import { PluginName, ThemeName } from "./commands";
+import { CoreVersion, PluginName, ThemeName } from "./commands";
 import { EnvKind, SiteActionResponse, SiteJobView } from "./sites";
 
 const id = z.string().regex(/^[a-z0-9]{1,64}$/);
@@ -49,6 +49,23 @@ export const UpdateThemeRequest = z.object({
   includeDb: z.boolean().optional(),
 });
 export type UpdateThemeRequest = z.infer<typeof UpdateThemeRequest>;
+
+/** Delete an inactive plugin or theme after snapshotting its folder (A137). */
+export const DeletePluginRequest = z.object({ plugin: PluginName });
+export const DeleteThemeRequest = z.object({ theme: ThemeName });
+
+/** Update WordPress core to the release the last update check offered (A135). */
+export const UpdateCoreRequest = z.object({ version: CoreVersion });
+
+export const CoreUpdateResponse = z.object({
+  /** updated: healthy on the new version. rolled_back: health failed, previous version restored. */
+  status: z.enum(["updated", "failed", "rolled_back", "rollback_failed"]),
+  fromVersion: z.string(),
+  toVersion: z.string(),
+  detail: z.string().max(2000),
+  jobs: z.array(SiteJobView),
+});
+export type CoreUpdateResponse = z.infer<typeof CoreUpdateResponse>;
 
 /** Backup strategy before a bulk environment update (A104). Drive is UI-only until Phase 2. */
 export const BulkUpdateStrategy = z.enum(["snapshots", "google_drive"]);

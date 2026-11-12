@@ -1,6 +1,8 @@
 import type { BulkUpdateStatusResponse, VersionJumpSafety } from "@ulixops/shared";
 import Link from "next/link";
+import { ActionForm } from "@/components/action-form";
 import { Notice } from "@/components/ui/notice";
+import { dismissBulkReportAction } from "../../../actions";
 import { cn } from "@/lib/utils";
 import { LiveRefresh } from "@/app/(app)/deployments/[id]/live-refresh";
 
@@ -22,10 +24,12 @@ export function BulkUpdateProgress({
   status,
   siteId,
   envQuery,
+  canDismiss,
 }: {
   status: BulkUpdateStatusResponse;
   siteId: string;
   envQuery: string;
+  canDismiss: boolean;
 }) {
   if (!status.runStatus) return null;
 
@@ -52,9 +56,18 @@ export function BulkUpdateProgress({
         <h2 className="text-base font-semibold">
           {live ? "Bulk update in progress" : "Bulk update report"}
         </h2>
-        <span className="rounded-md bg-muted px-1.5 py-0.5 text-xs font-medium uppercase tracking-wide text-muted-foreground">
-          {status.runStatus.replaceAll("_", " ")}
-        </span>
+        <div className="flex items-center gap-2">
+          <span className="rounded-md bg-muted px-1.5 py-0.5 text-xs font-medium uppercase tracking-wide text-muted-foreground">
+            {status.runStatus.replaceAll("_", " ")}
+          </span>
+          {/* Finished reports hide after 24 h on their own, or now (A136). */}
+          {!live && canDismiss && (
+            <ActionForm action={dismissBulkReportAction} submitLabel="Dismiss" variant="outline">
+              <input type="hidden" name="siteId" value={siteId} />
+              <input type="hidden" name="kind" value={envQuery.toUpperCase()} />
+            </ActionForm>
+          )}
+        </div>
       </div>
 
       {progress?.preHealth && (

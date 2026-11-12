@@ -21,6 +21,9 @@ export default async function SettingsLayout({ children }: Readonly<{ children: 
           {can(user.role, "secrets.manage") && (
             <NavLink href="/settings/credentials">Credentials</NavLink>
           )}
+          {can(user.role, "secrets.manage") && (
+            <NavLink href="/settings/google-drive">Google Drive</NavLink>
+          )}
           <NavLink href="/settings/ip-allowlist">IP allowlist</NavLink>
         </nav>
       </div>

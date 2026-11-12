@@ -52,8 +52,10 @@ describe("restoreSnapshot", () => {
   }): SshSession {
     const sftp: SftpSession = {
       readFile: vi.fn(),
+      readFileHead: vi.fn(),
       readFileTail: vi.fn(),
       mkdirp: vi.fn(),
+      listDir: vi.fn(async () => []),
       readTree: vi.fn(),
       writeTree: vi.fn(),
       unlink: vi.fn(async () => undefined),

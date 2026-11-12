@@ -91,6 +91,7 @@ describe.runIf(TEST_DATABASE_URL)("sites, approvals and credentials (Postgres)",
       get: (path: string) => set(request(app).get(path)),
       post: (path: string, body: object = {}) => set(request(app).post(path)).send(body),
       patch: (path: string, body: object) => set(request(app).patch(path)).send(body),
+      put: (path: string, body: object) => set(request(app).put(path)).send(body),
     };
   };
   const make = (role: "ADMIN" | "DEVELOPER" | "VIEWER", email?: string) =>
@@ -505,6 +506,56 @@ describe.runIf(TEST_DATABASE_URL)("sites, approvals and credentials (Postgres)",
         .post("/credentials", { name: "SHOP_SSH_KEY" })
         .expect(409);
       expect(taken.body.error).toBe("name_taken");
+    });
+  });
+
+  describe("Client Viewer tag scope (A178)", () => {
+    it("lists only matching sites, 404s others, and cannot scan", async () => {
+      const admin = await make("ADMIN");
+      const client = await userWithSession(db, "CLIENT_VIEWER", {
+        sessionSecret: SECRET,
+        now: NOW,
+        email: "client@example.test",
+        viewTag: "client a",
+      });
+      const matching = await createSite(admin.token, {
+        name: "Match",
+        tags: ["client a"],
+        production: { ...production, url: "https://match.example.test", sshHost: "match.ssh" },
+      });
+      const other = await createSite(admin.token, {
+        name: "Other",
+        tags: ["other"],
+        production: {
+          ...production,
+          url: "https://other.example.test",
+          sshHost: "other.ssh",
+          credentialRef: "OTHER_SSH_KEY",
+        },
+      });
+
+      const list = await as(client.token).get("/sites").expect(200);
+      expect(list.body.sites.map((s: { id: string }) => s.id)).toEqual([matching]);
+
+      await as(client.token).get(`/sites/${matching}`).expect(200);
+      await as(client.token).get(`/sites/${other}`).expect(404);
+
+      const malware = await as(client.token).get("/malware-scans/overview").expect(200);
+      expect(malware.body.sites.map((s: { siteId: string }) => s.siteId)).toEqual([matching]);
+
+      await as(client.token)
+        .post(`/sites/${matching}/environments/production/malware-scan`, {})
+        .expect(403);
+      await as(client.token).put("/malware-scans/schedule", {}).expect(403);
+
+      const session = await request(app)
+        .post("/auth/session")
+        .send({ sessionToken: client.token })
+        .expect(200);
+      expect(session.body.user).toMatchObject({
+        role: "CLIENT_VIEWER",
+        viewTag: "client a",
+      });
     });
   });
 });

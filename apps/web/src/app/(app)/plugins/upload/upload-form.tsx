@@ -1,14 +1,51 @@
 "use client";
 // Screen 7: drop a ZIP → UlixOps checks it and shows the checksum and every check → add the
 // changelog and the "changes database" flag → save. Nothing is kept unless every check passes.
-import { MAX_PLUGIN_ZIP_BYTES, type UploadCheck } from "@ulixops/shared";
+import { MAX_PLUGIN_ZIP_BYTES, PluginUploadResult, type UploadCheck } from "@ulixops/shared";
 import { CircleCheck, CircleX, FileArchive, Info, TriangleAlert } from "lucide-react";
-import { type DragEvent, useActionState, useId, useRef, useState } from "react";
+import { type DragEvent, type FormEvent, useId, useRef, useState } from "react";
+import { z } from "zod";
 import { ActionForm, CopyField } from "@/components/action-form";
-import { FormPendingOverlay, PendingSubmit } from "@/components/pending-ui";
+import { BusyOverlay } from "@/components/pending-ui";
+import { Button } from "@/components/ui/button";
 import { Label } from "@/components/ui/label";
 import { cn } from "@/lib/utils";
-import { type CheckState, checkPluginZipAction, savePluginVersionAction } from "../actions";
+import { savePluginVersionAction } from "../actions";
+
+interface CheckState {
+  error?: string;
+  result?: PluginUploadResult;
+}
+
+const UploadAnswer = z.union([
+  z.object({ result: PluginUploadResult }),
+  z.object({ error: z.string() }),
+]);
+
+/**
+ * Sends the raw ZIP to /api/plugins/upload. Not a Server Action: Cloudflare's managed rule for
+ * CVE-2025-55183 blocks Server Action requests with a large binary body (A141).
+ */
+async function checkZip(file: File): Promise<CheckState> {
+  try {
+    const res = await fetch(`/api/plugins/upload?filename=${encodeURIComponent(file.name)}`, {
+      method: "POST",
+      headers: { "content-type": "application/zip" },
+      body: file,
+      credentials: "same-origin",
+    });
+    const parsed = UploadAnswer.safeParse(await res.json().catch(() => null));
+    if (parsed.success) return parsed.data;
+    return {
+      error:
+        res.status === 403
+          ? "The upload was blocked before it reached UlixOps (HTTP 403). Refresh the page and try again."
+          : `The upload failed (HTTP ${res.status}). Refresh the page and try again.`,
+    };
+  } catch {
+    return { error: "The upload didn't go through. Check your connection and try again." };
+  }
+}
 
 const CHECK_LABELS: Record<UploadCheck["name"], string> = {
   file: "File: size and ZIP content",
@@ -22,13 +59,23 @@ const CHECK_LABELS: Record<UploadCheck["name"], string> = {
 const megabytes = (bytes: number) => `${(bytes / 1024 / 1024).toFixed(1)} MB`;
 
 export function UploadForm() {
-  const [state, checkAction] = useActionState<CheckState, FormData>(checkPluginZipAction, {});
+  const [state, setState] = useState<CheckState>({});
+  const [checking, setChecking] = useState(false);
   const [file, setFile] = useState<File | null>(null);
   const [dragging, setDragging] = useState(false);
   const input = useRef<HTMLInputElement>(null);
   const id = useId();
   const tooBig = file !== null && file.size > MAX_PLUGIN_ZIP_BYTES;
   const result = state.result;
+
+  async function onCheck(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!file || tooBig || checking) return;
+    setChecking(true);
+    setState({});
+    setState(await checkZip(file));
+    setChecking(false);
+  }
 
   function onDrop(event: DragEvent<HTMLLabelElement>) {
     event.preventDefault();
@@ -42,8 +89,8 @@ export function UploadForm() {
 
   return (
     <div className="grid gap-4">
-      <form action={checkAction} className="grid gap-3">
-        <FormPendingOverlay label="Checking ZIP…" />
+      <form onSubmit={onCheck} className="grid gap-3">
+        <BusyOverlay pending={checking} label="Checking ZIP…" />
         <label
           htmlFor={`${id}-zip`}
           onDragOver={(event) => {
@@ -93,9 +140,9 @@ export function UploadForm() {
           </p>
         )}
         <div>
-          <PendingSubmit disabled={!file || tooBig} pendingLabel="Checking…">
-            Check ZIP
-          </PendingSubmit>
+          <Button type="submit" disabled={!file || tooBig || checking}>
+            {checking ? "Checking…" : "Check ZIP"}
+          </Button>
         </div>
       </form>
 

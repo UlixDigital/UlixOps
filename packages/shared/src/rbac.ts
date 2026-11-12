@@ -22,8 +22,16 @@ export const PERMISSIONS = {
   "secrets.manage": "Manage site credentials and API tokens",
   "users.manage": "Invite users, change roles, reset 2FA",
   "settings.manage": "Change hub settings",
+  "vulns.sync": "Fetch the vulnerability feed now (it also runs daily)",
+  "dns.manage": "Add, edit and delete Cloudflare DNS records; request a DNS rollback",
+  "backups.restore":
+    "Restore a site from its Google Drive backup (a second Admin approves; it overwrites the site)",
   "approvals.decide": "Approve or reject risky actions",
   "audit.view": "Read the audit log",
+  "approvals.self":
+    "Approve your own risky actions at once (Super Admin; every other Admin is alerted)",
+  "alerts.track":
+    "See who saw each alert, who fixed it and whether the fix held; confirm or reject fixes (Super Admin)",
 } as const;
 export type Permission = keyof typeof PERMISSIONS;
 export const Permission = z.enum(Object.keys(PERMISSIONS) as [Permission, ...Permission[]]);
@@ -35,6 +43,9 @@ const VIEWER: readonly Permission[] = [
   "deployments.view",
   "notifications.view",
 ];
+
+/** Tag-scoped read-only (A178): dashboards/sites/security/monitoring/reports only via nav. */
+const CLIENT_VIEWER: readonly Permission[] = ["dashboard.view", "sites.view"];
 
 const DEVELOPER: readonly Permission[] = [
   ...VIEWER,
@@ -48,8 +59,12 @@ const DEVELOPER: readonly Permission[] = [
 
 export const ROLE_PERMISSIONS: Readonly<Record<RoleName, readonly Permission[]>> = {
   VIEWER,
+  CLIENT_VIEWER,
   DEVELOPER,
-  ADMIN: Permission.options,
+  ADMIN: Permission.options.filter((p) => p !== "approvals.self" && p !== "alerts.track"),
+  // Everything an Admin can do, plus approving their own risky actions (A134) and the alert
+  // follow-up report (A158).
+  SUPER_ADMIN: Permission.options,
 };
 
 export function can(role: RoleName, permission: Permission): boolean {
@@ -68,6 +83,9 @@ export function siteActionPermission(
     | "plugin.deactivate"
     | "plugin.update"
     | "theme.update"
+    | "core.update"
+    | "plugin.delete"
+    | "theme.delete"
     | "snapshot.create"
     | "snapshot.restore"
     | "maintenance"
@@ -78,6 +96,9 @@ export function siteActionPermission(
     action === "plugin.activate" ||
     action === "plugin.update" ||
     action === "theme.update" ||
+    action === "core.update" ||
+    action === "plugin.delete" ||
+    action === "theme.delete" ||
     action === "snapshot.create"
   ) {
     return environment === "PRODUCTION" ? "deploy.single" : "deploy.staging";
@@ -98,13 +119,17 @@ export type RiskyAction = (typeof RISKY_ACTIONS)[number];
 export type ApprovalDecisionCheck =
   { ok: true } | { ok: false; reason: "not_admin" | "own_request" | "already_decided" };
 
-/** Only an Admin may decide, never on their own request, and only while it is pending. */
+/**
+ * Only an Admin may decide, only while it is pending, and never on their own request, except a
+ * Super Admin, who self-approves (A134).
+ */
 export function canDecideApproval(
   request: { requestedById: string; status: string },
   decider: { id: string; role: RoleName },
 ): ApprovalDecisionCheck {
   if (!can(decider.role, "approvals.decide")) return { ok: false, reason: "not_admin" };
-  if (request.requestedById === decider.id) return { ok: false, reason: "own_request" };
+  if (request.requestedById === decider.id && !can(decider.role, "approvals.self"))
+    return { ok: false, reason: "own_request" };
   if (request.status !== "PENDING") return { ok: false, reason: "already_decided" };
   return { ok: true };
 }

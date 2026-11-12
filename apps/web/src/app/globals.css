@@ -38,14 +38,17 @@
   --input: #e4e4e7;
   --ring: #2563eb;
   --link: #2563eb;
-  --sidebar: #fafafa;
-  --sidebar-foreground: #09090b;
-  --sidebar-primary: #2563eb;
+  /* Brand sidebar: UlixOPS blues (#0D2047 → #021236 top→bottom). Always light text on blue. */
+  --sidebar-from: #0d2047;
+  --sidebar-to: #021236;
+  --sidebar: #0d2047;
+  --sidebar-foreground: #eef3ff;
+  --sidebar-primary: #3b82f6;
   --sidebar-primary-foreground: #ffffff;
-  --sidebar-accent: #f4f4f5;
-  --sidebar-accent-foreground: #18181b;
-  --sidebar-border: #e4e4e7;
-  --sidebar-ring: #2563eb;
+  --sidebar-accent: rgb(255 255 255 / 0.14);
+  --sidebar-accent-foreground: #ffffff;
+  --sidebar-border: rgb(255 255 255 / 0.18);
+  --sidebar-ring: #93c5fd;
 }
 
 .dark {
@@ -69,14 +72,16 @@
   --input: #27272a;
   --ring: #60a5fa;
   --link: #60a5fa;
-  --sidebar: #0b2a6f;
-  --sidebar-foreground: #e4e4e7;
-  --sidebar-primary: #2563eb;
+  --sidebar-from: #0d2047;
+  --sidebar-to: #021236;
+  --sidebar: #0d2047;
+  --sidebar-foreground: #eef3ff;
+  --sidebar-primary: #3b82f6;
   --sidebar-primary-foreground: #ffffff;
-  --sidebar-accent: #1e3a8a;
+  --sidebar-accent: rgb(255 255 255 / 0.14);
   --sidebar-accent-foreground: #ffffff;
-  --sidebar-border: #1e3a8a;
-  --sidebar-ring: #60a5fa;
+  --sidebar-border: rgb(255 255 255 / 0.18);
+  --sidebar-ring: #93c5fd;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -101,14 +106,16 @@
     --input: #27272a;
     --ring: #60a5fa;
     --link: #60a5fa;
-    --sidebar: #0b2a6f;
-    --sidebar-foreground: #e4e4e7;
-    --sidebar-primary: #2563eb;
+    --sidebar-from: #0d2047;
+    --sidebar-to: #021236;
+    --sidebar: #0d2047;
+    --sidebar-foreground: #eef3ff;
+    --sidebar-primary: #3b82f6;
     --sidebar-primary-foreground: #ffffff;
-    --sidebar-accent: #1e3a8a;
+    --sidebar-accent: rgb(255 255 255 / 0.14);
     --sidebar-accent-foreground: #ffffff;
-    --sidebar-border: #1e3a8a;
-    --sidebar-ring: #60a5fa;
+    --sidebar-border: rgb(255 255 255 / 0.18);
+    --sidebar-ring: #93c5fd;
   }
 }
 
@@ -167,5 +174,13 @@
       animation-duration: 0.01ms !important;
       transition-duration: 0.01ms !important;
     }
+  }
+}
+
+/* Brand sidebar fill: light → dark UlixOPS blues (owner request; exception to flat-fill rule). */
+@layer utilities {
+  .bg-sidebar-brand {
+    background-color: var(--sidebar-from);
+    background-image: linear-gradient(to bottom, var(--sidebar-from), var(--sidebar-to));
   }
 }

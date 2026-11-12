@@ -10,6 +10,7 @@ Owned by an Admin and reviewed every quarter:
    - An Admin's password-manager and Infisical recovery details: the vault admin password (from `~/infisical-admin.txt` on the first deploy) and the `INFISICAL_ENCRYPTION_KEY` and `INFISICAL_AUTH_SECRET` lines of the server's `~/ulixops.env`. Without the encryption key, a vault backup can't be read.
    - An emergency SSH key pair registered with the WP Engine SSH Gateway (and with each non-WP Engine host), on an encrypted USB drive or hardware token. Its passphrase is stored separately from the drive.
    - WP Engine User Portal login for an Admin, with its 2FA recovery codes.
+   - The **backup encryption key** (64 hex characters, A145) and the ulixdevs@gmail.com login with its 2FA recovery codes. The weekly site backups on that Google Drive can only be opened with this key.
 2. **Site access sheet** (printed, in the kit): for each site, the WP Engine install/environment name, the SSH host and user, and the WordPress path.
 3. **Hub and vault database backups:** encrypted daily, stored off the VPS, with the decryption key in the kit. UlixOps's own SSH keys live only in the vault; break-glass uses the emergency key above, not those. On the VPS, schedule `scripts/backup-hub-db.sh` (needs `DATABASE_URL`, `HUB_BACKUP_DIR`, `HUB_BACKUP_PASSPHRASE`) via cron; copy dumps off-box.
 
@@ -45,3 +46,11 @@ Live hub (AWS): `ssh -i ~/.ssh/ulixops_deploy_ed25519 -o IdentitiesOnly=yes ulix
 1. Provision a fresh VPS (or repair the existing one) and restore Docker Compose from the repo.
 2. Restore the latest good encrypted Postgres backup (key from the kit).
 3. Reconnect the vault and Cloudflare Zero Trust, then confirm that logins (with 2FA) and the audit log work before resuming deployments.
+
+## Restoring a site from its Google Drive backup (works without the hub)
+
+1. Sign in to Google Drive as ulixdevs@gmail.com → folder **UlixOps Backups** → the site's folder → download the `.tar.gz.ulxb` file.
+2. On any computer with Node.js 18+ and a copy of this repository's `scripts/decrypt-backup.mjs` (it has no dependencies):
+   `BACKUP_KEY=<key from the kit> node scripts/decrypt-backup.mjs site.tar.gz.ulxb site.tar.gz`
+   It stops with an error if the key is wrong or the file was cut short or altered.
+3. `tar -xzf site.tar.gz`: the WordPress files, plus `ulixops-<id>.sql` (the database) at the top. Upload the files over SFTP and import the database with `wp db import` (or the host's tools), then check the site.

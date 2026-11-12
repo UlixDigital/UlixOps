@@ -4,6 +4,7 @@ import {
   BarChart3,
   Bell,
   ClipboardCheck,
+  ClipboardList,
   Globe,
   LayoutDashboard,
   type LucideIcon,
@@ -30,4 +31,5 @@ export const NAV_ICONS: Record<NavIcon, LucideIcon> = {
   dns: Globe,
   monitoring: Activity,
   reports: BarChart3,
+  followup: ClipboardList,
 };

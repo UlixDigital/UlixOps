@@ -33,6 +33,7 @@ export function toUserSummary(user: User, activeSessions: number): UserSummary {
     email: user.email,
     name: user.name,
     role: user.role,
+    viewTag: user.viewTag,
     active: user.active,
     twoFactorEnabled: user.twoFactorEnabled,
     setupPending: user.passwordHash === null,

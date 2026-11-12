@@ -1,5 +1,5 @@
 // Spec screen 8: a plugin's version history and which version each site runs. "Update outdated
-// sites" opens the deploy wizard, which arrives in Build Order step 10.
+// sites" opens the deploy wizard with the outdated production sites picked.
 import { can, PluginDetail } from "@ulixops/shared";
 import type { Metadata } from "next";
 import Link from "next/link";

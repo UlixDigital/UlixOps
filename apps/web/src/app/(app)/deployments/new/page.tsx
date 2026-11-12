@@ -1,5 +1,5 @@
 // Spec screen 9: deploy wizard — plugin + version, sites, rollout settings, review.
-import { can, PluginDetail, PluginList, SiteList } from "@ulixops/shared";
+import { can, PluginDetail, PluginList, RecordId, SiteList } from "@ulixops/shared";
 import type { Metadata } from "next";
 import Link from "next/link";
 import { NoAccess } from "@/components/no-access";
@@ -23,6 +23,8 @@ export default async function NewDeploymentPage({
   const pluginSlug = typeof params.plugin === "string" ? params.plugin : "";
   const version = typeof params.version === "string" ? params.version : "";
   const outdatedOnly = params.outdated === "1";
+  /** From a site's Deployments tab: start with that site picked. */
+  const siteParam = RecordId.safeParse(params.site);
 
   const auth = await apiAuth();
   const [plugins, sites] = await Promise.all([
@@ -48,6 +50,9 @@ export default async function NewDeploymentPage({
       }
     }
   }
+
+  if (siteParam.success && sites.data.sites.some((s) => s.id === siteParam.data))
+    preselectedSiteIds = [...new Set([...preselectedSiteIds, siteParam.data])];
 
   const siteOptions = sites.data.sites.map((s) => {
     const prod = s.environments.find((e) => e.kind === "PRODUCTION");

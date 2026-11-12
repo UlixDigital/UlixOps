@@ -113,8 +113,9 @@ export default async function GeneralSettingsPage() {
         <CardHeader>
           <CardTitle className="text-base">Health checks</CardTitle>
           <CardDescription>
-            Homepage and wp-admin are always checked. Extra paths, response-time threshold, and
-            optional debug.log scanning apply to every site (spec §6.6).
+            The homepage is always checked; wp-admin only if switched on below. Extra paths,
+            response-time threshold, and optional debug.log scanning apply to every site (spec
+            §6.6).
           </CardDescription>
         </CardHeader>
         <CardContent>

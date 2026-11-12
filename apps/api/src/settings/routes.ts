@@ -5,6 +5,8 @@ import {
   IpAllowlistSetting,
   type SettingsView,
   SnapshotRetentionSetting,
+  type VulnFeedStatus,
+  WORDFENCE_KEY_REF,
 } from "@ulixops/shared";
 import { Router } from "express";
 import { audit } from "../audit";
@@ -14,6 +16,8 @@ import { readHealthSettings, writeHealthSettings } from "../health/settings";
 import { authorize, clientIpOf, sessionOf } from "../http/guard";
 import { readNotificationPrefs } from "../notifications/prefs";
 import { readRetentionDays, writeRetentionDays } from "../snapshots/retention";
+import { readDriveRecord } from "../full-backups/service";
+import { readFeedStatus } from "../vulnerabilities/service";
 
 const ALLOWLIST_KEY = "ip_allowlist";
 const EMPTY_ALLOWLIST: IpAllowlistSetting = { enabled: false, entries: [] };
@@ -34,7 +38,30 @@ export async function readAllowlist(db: Db): Promise<IpAllowlistSetting> {
   return parsed.success ? parsed.data : EMPTY_ALLOWLIST;
 }
 
-function integrations(configured: Record<string, boolean>): SettingsView["integrations"] {
+function wordfenceIntegration(feed: VulnFeedStatus): SettingsView["integrations"][number] {
+  const name = "Wordfence Intelligence";
+  if (feed.ok === true)
+    return {
+      key: "wordfence",
+      name,
+      status: "configured",
+      note: `Vulnerability feed synced ${feed.lastSuccessAt?.slice(0, 16).replace("T", " ")} UTC; runs daily`,
+    };
+  return {
+    key: "wordfence",
+    name,
+    status: "not_configured",
+    note:
+      feed.error ??
+      `Vulnerability feed: add the API key (${WORDFENCE_KEY_REF}) in Settings → Credentials; a second Admin approves`,
+  };
+}
+
+function integrations(
+  configured: Record<string, boolean>,
+  feed: VulnFeedStatus,
+  drive: { email: string | null } | null,
+): SettingsView["integrations"] {
   const status = (key: string) => (configured[key] ? "configured" : "not_configured");
   return [
     {
@@ -61,7 +88,20 @@ function integrations(configured: Record<string, boolean>): SettingsView["integr
       status: status("slack"),
       note: "SLACK_WEBHOOK_URL on the server; event toggles below",
     },
-    { key: "drive", name: "Google Drive", status: "planned", note: "Scheduled backups, Phase 2" },
+    wordfenceIntegration(feed),
+    drive
+      ? {
+          key: "drive",
+          name: "Google Drive",
+          status: "configured",
+          note: `Weekly encrypted backups to ${drive.email ?? "the connected account"}`,
+        }
+      : {
+          key: "drive",
+          name: "Google Drive",
+          status: "not_configured",
+          note: "Weekly encrypted backups: connect on Backups → Full backups",
+        },
     {
       key: "cloudflare",
       name: "Cloudflare DNS",
@@ -90,7 +130,11 @@ export function settingsRouter(deps: SettingsDeps): Router {
       snapshotRetentionDays: await readRetentionDays(db, deps.defaultRetentionDays),
       healthCheck: await readHealthSettings(db),
       notificationPrefs: await readNotificationPrefs(db),
-      integrations: integrations(deps.configured),
+      integrations: integrations(
+        deps.configured,
+        await readFeedStatus(db),
+        await readDriveRecord(db),
+      ),
     };
     res.json(view);
   });

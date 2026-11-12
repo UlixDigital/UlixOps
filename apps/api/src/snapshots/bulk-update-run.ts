@@ -24,9 +24,15 @@ import type { SecurityNotifier } from "../notify";
 import type { RunnerClient } from "../runner/client";
 import { readRetentionDays } from "./retention";
 import type { SnapshotStore } from "./store";
+import { coreUpdateFields } from "../sites/operations";
+import { afterInventoryChange } from "../vulnerabilities/service";
+import { finishAfterVisualCheck, startBeforeVisualCheck } from "../visual/service";
+import type { VisualStore } from "../visual/store";
 
 const SNAPSHOT_TIMEOUT_MS = 180_000;
-const UPDATE_TIMEOUT_MS = 120_000;
+// The runner's own cap is 300 s; on top come the SSH Gateway connect and a busy runner queue
+// (A136: Elementor timed out here at 330 s while the update itself was still running).
+export const UPDATE_TIMEOUT_MS = 420_000;
 const HEALTH_TIMEOUT_MS = 90_000;
 const INVENTORY_TIMEOUT_MS = 180_000;
 
@@ -45,11 +51,13 @@ export interface BulkRunDeps {
   snapshots: SnapshotStore;
   defaultRetentionDays: number;
   notifier: SecurityNotifier;
+  /** One before/after pair around the whole run (A163). */
+  visualStore?: VisualStore;
 }
 
-type EnvPinned = SiteEnvironment & { hostKey: string };
+export type EnvPinned = SiteEnvironment & { hostKey: string };
 
-function targetOf(env: EnvPinned) {
+export function targetOf(env: EnvPinned) {
   return {
     host: env.sshHost,
     port: env.sshPort,
@@ -122,13 +130,14 @@ function buildReport(opts: {
   return lines.join("\n");
 }
 
-async function runHealth(
-  deps: BulkRunDeps,
+/** One health check with the hub's settings (also used after core updates, A135). */
+export async function runHealth(
+  deps: Pick<BulkRunDeps, "db" | "runner">,
   env: EnvPinned,
 ): Promise<{ ok: boolean; summary: string }> {
   const settings = await readHealthSettings(deps.db);
   const origin = healthFetchOrigin(env.url, env.sshHost);
-  const urls = buildHealthUrls(origin, settings.extraPaths);
+  const urls = buildHealthUrls(origin, settings);
   const raw = await deps.runner.run(
     {
       type: "site.health",
@@ -147,14 +156,54 @@ async function runHealth(
   return { ok: result.ok, summary: result.summary.slice(0, 1500) };
 }
 
+/** Re-read versions and offered updates, store them, re-match vulnerabilities. */
+export async function refreshInventory(
+  deps: Omit<BulkRunDeps, "snapshots">,
+  env: EnvPinned,
+  actorUserId: string | null,
+): Promise<boolean> {
+  const invRaw = await deps.runner.run(
+    { type: "site.inventory", target: targetOf(env), checkUpdates: true },
+    INVENTORY_TIMEOUT_MS,
+  );
+  const inv = SiteInventoryResult.parse(invRaw);
+  if (inv.hostKeyMismatch) return false;
+  const data = {
+    refreshedAt: deps.now(),
+    refreshedById: actorUserId,
+    wpVersion: inv.wpVersion,
+    phpVersion: inv.phpVersion,
+    wpCliVersion: inv.wpCliVersion,
+    activeTheme: inv.themes.find((t) => t.status === "active")?.name ?? null,
+    maintenance: inv.maintenance,
+    safeMode: inv.safeMode,
+    warnings: inv.warnings,
+    plugins: inv.plugins,
+    themes: inv.themes,
+    ...coreUpdateFields(inv, null, deps.now()),
+  };
+  await deps.db.siteInventory.upsert({
+    where: { environmentId: env.id },
+    create: { environmentId: env.id, ...data },
+    update: data,
+  });
+  await afterInventoryChange(deps, env.id);
+  return true;
+}
+
 export async function executeBulkUpdateRun(
-  deps: BulkRunDeps,
+  deps: Omit<BulkRunDeps, "snapshots">,
   opts: {
     site: Site;
     env: EnvPinned;
     items: BulkPlannedItem[];
-    actorUserId: string;
+    /** null: the scheduled run (A162). */
+    actorUserId: string | null;
     onProgress: (progress: BulkUpdateRunProgress) => Promise<void>;
+    /** Unattended runs: stop at the first failure; the rest stay "pending" (A162). */
+    stopOnFailure?: boolean;
+    /** Unattended runs: don't update a site that is already unhealthy (A162). */
+    requireHealthyStart?: boolean;
   },
 ): Promise<{
   results: BulkUpdateItemResult[];
@@ -188,11 +237,43 @@ export async function executeBulkUpdateRun(
   };
   await publish();
 
+  let visualCheckId = "";
+  if (deps.visualStore) {
+    try {
+      const before = await startBeforeVisualCheck(
+        {
+          db: deps.db,
+          runner: deps.runner,
+          store: deps.visualStore,
+          notifier: deps.notifier,
+          now: deps.now,
+        },
+        {
+          id: env.id,
+          kind: env.kind,
+          url: env.url,
+          sshHost: env.sshHost,
+          siteId: site.id,
+          site: { id: site.id, name: site.name, archived: site.archived },
+        },
+        {
+          trigger: actorUserId === null ? "autoupdate" : "update",
+          userId: actorUserId,
+        },
+      );
+      if (!before.skipped) visualCheckId = before.checkId;
+    } catch {
+      // Visual is best-effort; never block the update run.
+    }
+  }
+
   const results: BulkUpdateItemResult[] = [];
   let failures = 0;
   const days = await readRetentionDays(deps.db, deps.defaultRetentionDays);
 
   for (let index = 0; index < items.length; index++) {
+    if (opts.requireHealthyStart && !preOk) break;
+    if (opts.stopOnFailure && failures > 0) break;
     const item = items[index];
     const itemProgress = progress.items[index];
     if (!item || !itemProgress) continue;
@@ -479,34 +560,35 @@ export async function executeBulkUpdateRun(
 
   let inventoryRefreshed = false;
   try {
-    const invRaw = await deps.runner.run(
-      { type: "site.inventory", target: targetOf(env), checkUpdates: true },
-      INVENTORY_TIMEOUT_MS,
-    );
-    const inv = SiteInventoryResult.parse(invRaw);
-    if (!inv.hostKeyMismatch) {
-      const data = {
-        refreshedAt: deps.now(),
-        refreshedById: actorUserId,
-        wpVersion: inv.wpVersion,
-        phpVersion: inv.phpVersion,
-        wpCliVersion: inv.wpCliVersion,
-        activeTheme: inv.themes.find((t) => t.status === "active")?.name ?? null,
-        maintenance: inv.maintenance,
-        safeMode: inv.safeMode,
-        warnings: inv.warnings,
-        plugins: inv.plugins,
-        themes: inv.themes,
-      };
-      await deps.db.siteInventory.upsert({
-        where: { environmentId: env.id },
-        create: { environmentId: env.id, ...data },
-        update: data,
-      });
-      inventoryRefreshed = true;
-    }
+    inventoryRefreshed = await refreshInventory(deps, env, actorUserId);
   } catch {
     // best-effort
+  }
+
+  if (visualCheckId && deps.visualStore) {
+    try {
+      await finishAfterVisualCheck(
+        {
+          db: deps.db,
+          runner: deps.runner,
+          store: deps.visualStore,
+          notifier: deps.notifier,
+          now: deps.now,
+        },
+        {
+          id: env.id,
+          kind: env.kind,
+          url: env.url,
+          sshHost: env.sshHost,
+          siteId: site.id,
+          site: { id: site.id, name: site.name, archived: site.archived },
+        },
+        visualCheckId,
+        { userId: actorUserId },
+      );
+    } catch {
+      // best-effort
+    }
   }
 
   const finishedAt = deps.now().toISOString();

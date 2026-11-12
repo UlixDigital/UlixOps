@@ -66,7 +66,7 @@ describe.runIf(TEST_DATABASE_URL)("admin features (Postgres)", () => {
         .set("x-ulix-client-ip", ip)
         .send(body),
   });
-  const make = (role: "ADMIN" | "DEVELOPER" | "VIEWER", email?: string) =>
+  const make = (role: "SUPER_ADMIN" | "ADMIN" | "DEVELOPER" | "VIEWER", email?: string) =>
     userWithSession(db, role, { sessionSecret: SECRET, now: NOW, ...(email ? { email } : {}) });
   const lastAudit = (action: string) =>
     db.auditLog.findFirst({ where: { action }, orderBy: { createdAt: "desc" } });
@@ -191,6 +191,47 @@ describe.runIf(TEST_DATABASE_URL)("admin features (Postgres)", () => {
       expect((await as(admin.token).patch("/users/nope", { role: "VIEWER" })).status).toBe(404);
     });
 
+    it("lets a Super Admin promote an Admin with 2FA, and refuses Admins / non-Admins (A172)", async () => {
+      const boss = await make("SUPER_ADMIN", "boss@example.test");
+      const admin = await make("ADMIN", "admin@example.test");
+      const peer = await make("ADMIN", "peer@example.test");
+      const viewer = await make("VIEWER", "viewer@example.test");
+
+      expect(
+        (await as(admin.token).patch(`/users/${peer.user.id}`, { role: "SUPER_ADMIN" })).body,
+      ).toEqual({ error: "forbidden" });
+
+      expect(
+        (await as(boss.token).patch(`/users/${viewer.user.id}`, { role: "SUPER_ADMIN" })).body,
+      ).toEqual({ error: "needs_admin_2fa" });
+
+      await db.user.update({ where: { id: peer.user.id }, data: { twoFactorEnabled: false } });
+      expect(
+        (await as(boss.token).patch(`/users/${peer.user.id}`, { role: "SUPER_ADMIN" })).body,
+      ).toEqual({ error: "needs_admin_2fa" });
+      await db.user.update({ where: { id: peer.user.id }, data: { twoFactorEnabled: true } });
+
+      const promoted = await as(boss.token)
+        .patch(`/users/${admin.user.id}`, { role: "SUPER_ADMIN" })
+        .expect(200);
+      expect(promoted.body.user.role).toBe("SUPER_ADMIN");
+      expect((await lastAudit("user.super_admin.grant"))?.meta).toMatchObject({
+        subjectId: admin.user.id,
+        via: "ui",
+        to: "SUPER_ADMIN",
+      });
+
+      const demoted = await as(boss.token)
+        .patch(`/users/${admin.user.id}`, { role: "ADMIN" })
+        .expect(200);
+      expect(demoted.body.user.role).toBe("ADMIN");
+      expect((await lastAudit("user.super_admin.revoke"))?.meta).toMatchObject({
+        subjectId: admin.user.id,
+        via: "ui",
+        from: "SUPER_ADMIN",
+      });
+    });
+
     it("deactivating someone ends their sessions at once", async () => {
       const admin = await make("ADMIN");
       const dev = await make("DEVELOPER");
@@ -304,7 +345,8 @@ describe.runIf(TEST_DATABASE_URL)("admin features (Postgres)", () => {
         wpengine: "configured",
         smtp: "not_configured",
         slack: "configured",
-        drive: "planned",
+        wordfence: "not_configured",
+        drive: "not_configured",
         cloudflare: "planned",
       });
     });

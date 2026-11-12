@@ -8,17 +8,22 @@ import {
   SiteTestResult,
   type SiteView,
   UpdateSiteRequest,
+  type UptimeSummary,
+  type VulnSummary,
 } from "@ulixops/shared";
 import { type Request, type Response, Router } from "express";
 import { raiseAlert } from "../alerts";
-import { requestApproval } from "../approvals/routes";
+import { requestApproval, selfApproveIfAllowed } from "../approvals/routes";
 import { audit } from "../audit";
 import type { Db } from "../db";
 import type { Prisma, SiteEnvironment, SiteInventory } from "../generated/prisma/client";
 import { authorize, clientIpOf, sessionOf } from "../http/guard";
 import type { SecurityNotifier } from "../notify";
 import { type RunnerClient, RunnerJobFailedError, RunnerUnavailableError } from "../runner/client";
+import { canAccessSite, siteWhereForUser } from "./access";
 import { inventorySummary } from "./operations";
+import { uptimeSummaries } from "../monitoring/uptime";
+import { vulnSummaries } from "../vulnerabilities/routes";
 
 export interface SitesDeps {
   db: Db;
@@ -34,6 +39,8 @@ type SiteWithEnvironments = Prisma.SiteGetPayload<{ include: typeof withEnvironm
 
 function environmentView(
   env: SiteEnvironment & { inventory: SiteInventory | null },
+  vulnerabilities?: VulnSummary,
+  uptime?: UptimeSummary,
 ): EnvironmentView {
   return {
     kind: env.kind,
@@ -54,6 +61,22 @@ function environmentView(
     lastHealthOk: env.lastHealthOk,
     lastHealthSummary: env.lastHealthSummary,
     inventory: env.inventory ? inventorySummary(env.inventory) : null,
+    ...(vulnerabilities ? { vulnerabilities } : {}),
+    ...(uptime ? { uptime } : {}),
+    filesSftp: (() => {
+      const authKind = env.filesSftpAuthKind === "password" ? "password" : "key";
+      return {
+        enabled: Boolean(env.filesSftpHost && env.filesSftpUser && env.filesSftpPath),
+        host: env.filesSftpHost,
+        port: env.filesSftpPort,
+        user: env.filesSftpUser,
+        path: env.filesSftpPath,
+        authKind,
+        credentialRef: authKind === "key" ? env.filesSftpCredentialRef : null,
+        passwordSet: authKind === "password" && Boolean(env.filesSftpCredentialRef),
+        hostKeyPinned: Boolean(env.filesSftpHostKey),
+      };
+    })(),
   };
 }
 
@@ -96,6 +119,15 @@ export function sitesRouter(deps: SitesDeps): Router {
 
   async function views(sites: SiteWithEnvironments[]): Promise<SiteView[]> {
     const counts = await pendingCounts(sites.map((s) => s.id));
+    const vulns = await vulnSummaries(
+      db,
+      sites.flatMap((s) => s.environments.map((e) => e.id)),
+    );
+    const uptime = await uptimeSummaries(
+      db,
+      sites.flatMap((s) => s.environments.filter((e) => e.kind === "PRODUCTION")),
+      now(),
+    );
     return sites.map((site) => ({
       id: site.id,
       name: site.name,
@@ -104,7 +136,9 @@ export function sitesRouter(deps: SitesDeps): Router {
       tags: site.tags,
       archived: site.archived,
       createdAt: site.createdAt.toISOString(),
-      environments: site.environments.map(environmentView),
+      environments: site.environments.map((env) =>
+        environmentView(env, vulns.get(env.id), uptime.get(env.id)),
+      ),
       pendingApprovals: counts.get(site.id) ?? 0,
     }));
   }
@@ -114,7 +148,10 @@ export function sitesRouter(deps: SitesDeps): Router {
     const site = id.success
       ? await db.site.findUnique({ where: { id: id.data }, include: withEnvironments })
       : null;
-    if (!site) res.status(404).json({ error: "not_found" });
+    if (!site || !canAccessSite(sessionOf(req).user, site)) {
+      res.status(404).json({ error: "not_found" });
+      return null;
+    }
     return site;
   }
 
@@ -140,8 +177,9 @@ export function sitesRouter(deps: SitesDeps): Router {
 
   router.get("/", canView, async (req, res) => {
     const includeArchived = req.query.archived === "1";
+    const scope = siteWhereForUser(sessionOf(req).user);
     const sites = await db.site.findMany({
-      where: includeArchived ? {} : { archived: false },
+      where: includeArchived ? scope : { AND: [scope, { archived: false }] },
       include: withEnvironments,
       orderBy: { name: "asc" },
     });
@@ -229,21 +267,33 @@ export function sitesRouter(deps: SitesDeps): Router {
       };
       if (JSON.stringify(from) !== JSON.stringify(to)) {
         // Key, server or user: a second Admin must approve (agent decision A47).
+        const { user } = sessionOf(req);
         const requested = await requestApproval(
           db,
           {
             action: "site.connection.change",
             payload: { siteId: site.id, kind, from, to },
-            requestedById: sessionOf(req).user.id,
+            requestedById: user.id,
             ip: clientIpOf(req),
+            requesterRole: user.role,
           },
           now(),
           deps.notifier,
         );
+        const selfApproved =
+          requested.ok &&
+          (await selfApproveIfAllowed(
+            { db, now, notifier: deps.notifier },
+            requested.id,
+            user,
+            clientIpOf(req),
+          ));
         approvalsRequested.push(
-          requested.ok
-            ? `${kind.toLowerCase()} connection`
-            : `${kind.toLowerCase()} connection (already waiting)`,
+          !requested.ok
+            ? `${kind.toLowerCase()} connection (already waiting)`
+            : selfApproved
+              ? `${kind.toLowerCase()} connection (self-approved, applied)`
+              : `${kind.toLowerCase()} connection`,
         );
       }
     }
@@ -292,6 +342,7 @@ export function sitesRouter(deps: SitesDeps): Router {
         payload: { siteId: site.id, kind: "PRODUCTION", name: site.name },
         requestedById: user.id,
         ip: clientIpOf(req),
+        requesterRole: user.role,
       },
       now(),
     );
@@ -299,8 +350,17 @@ export function sitesRouter(deps: SitesDeps): Router {
       res.status(409).json({ error: "already_pending" });
       return;
     }
-    await record(req, "site.archive", site.id, "pending", { requestId: asked.id });
-    res.json({ ok: true, approvalId: asked.id });
+    const selfApproved = await selfApproveIfAllowed(
+      { db, now, notifier: deps.notifier },
+      asked.id,
+      user,
+      clientIpOf(req),
+    );
+    await record(req, "site.archive", site.id, selfApproved ? "success" : "pending", {
+      requestId: asked.id,
+      selfApproved,
+    });
+    res.json({ ok: true, approvalId: asked.id, selfApproved });
   });
 
   router.post("/:id/restore", canManage, async (req, res) => {
@@ -400,13 +460,15 @@ export function sitesRouter(deps: SitesDeps): Router {
       res.status(404).json({ error: "not_found" });
       return;
     }
+    const { user } = sessionOf(req);
     const requested = await requestApproval(
       db,
       {
         action: "site.hostkey.reset",
         payload: { siteId: site.id, kind: env.kind, hostKey: env.hostKey },
-        requestedById: sessionOf(req).user.id,
+        requestedById: user.id,
         ip: clientIpOf(req),
+        requesterRole: user.role,
       },
       now(),
       deps.notifier,
@@ -415,7 +477,13 @@ export function sitesRouter(deps: SitesDeps): Router {
       res.status(409).json({ error: requested.error });
       return;
     }
-    res.status(202).json({ ok: true });
+    const selfApproved = await selfApproveIfAllowed(
+      { db, now, notifier: deps.notifier },
+      requested.id,
+      user,
+      clientIpOf(req),
+    );
+    res.status(202).json({ ok: true, selfApproved });
   });
 
   return router;

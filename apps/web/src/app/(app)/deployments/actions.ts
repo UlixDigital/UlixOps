@@ -38,11 +38,15 @@ export async function createDeploymentAction(
   );
   if (!res.ok) return { error: errorMessage(res.error) };
   revalidatePath("/deployments");
-  if (res.data.approvalId) {
+  if (res.data.deployment.status === "PENDING_APPROVAL") {
     await setFlash("Deployment submitted — waiting for Admin approval");
     redirect(`/deployments/${res.data.deployment.id}`);
   }
-  await setFlash("Deployment started");
+  await setFlash(
+    res.data.approvalId
+      ? "Deployment self-approved and started (the other Admins were notified)"
+      : "Deployment started",
+  );
   redirect(`/deployments/${res.data.deployment.id}`);
 }
 

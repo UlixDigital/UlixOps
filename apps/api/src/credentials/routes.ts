@@ -6,26 +6,39 @@ import {
   CredentialsListResult,
   type CredentialView,
   ROTATION_DAYS,
+  isReservedVaultName,
 } from "@ulixops/shared";
 import { Router } from "express";
 import { audit } from "../audit";
 import type { Db } from "../db";
 import { authorize, clientIpOf, sessionOf } from "../http/guard";
+import type { SecurityNotifier } from "../notify";
 import type { RunnerClient } from "../runner/client";
 import { callRunner } from "../sites/routes";
+import { apiKeysRouter } from "./api-keys";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
-export function credentialsRouter(deps: { db: Db; now: () => Date; runner: RunnerClient }): Router {
+export function credentialsRouter(deps: {
+  db: Db;
+  now: () => Date;
+  runner: RunnerClient;
+  notifier?: SecurityNotifier;
+}): Router {
   const { db, now } = deps;
   const router = Router();
   router.use(authorize("secrets.manage", deps));
+  // Integration API keys (A133): Admins, approval first, value sealed to the runner.
+  router.use("/api-keys", apiKeysRouter(deps));
 
   router.get("/", async (_req, res) => {
     // Listing is quick; a page waiting on it should fail fast if the runner is down.
     const raw = await callRunner(res, () => deps.runner.run({ type: "credentials.list" }, 10_000));
     if (raw === null) return;
-    const { credentials } = CredentialsListResult.parse(raw);
+    // The vault also holds the Wordfence keys (A132, A139); they are not SSH keys, so hide them.
+    const credentials = CredentialsListResult.parse(raw).credentials.filter(
+      (c) => !isReservedVaultName(c.name),
+    );
     const envs = await db.siteEnvironment.findMany({
       where: { credentialRef: { in: credentials.map((c) => c.name) } },
       select: { credentialRef: true, kind: true, site: { select: { id: true, name: true } } },
@@ -48,6 +61,11 @@ export function credentialsRouter(deps: { db: Db; now: () => Date; runner: Runne
     const body = CreateCredentialRequest.safeParse(req.body);
     if (!body.success) {
       res.status(400).json({ error: "bad_request" });
+      return;
+    }
+    // Reserved for integration keys (A132/A133) and Files SFTP passwords (A182).
+    if (isReservedVaultName(body.data.name)) {
+      res.status(409).json({ error: "name_taken" });
       return;
     }
     let taken = false;

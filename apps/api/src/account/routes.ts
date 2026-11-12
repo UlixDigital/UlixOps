@@ -31,7 +31,13 @@ export function accountRouter(deps: { db: Db; now: () => Date; auth: AuthService
       orderBy: { lastSeenAt: "desc" },
     });
     res.json({
-      user: { id: account.id, email: account.email, name: account.name, role: account.role },
+      user: {
+        id: account.id,
+        email: account.email,
+        name: account.name,
+        role: account.role,
+        viewTag: account.viewTag,
+      },
       twoFactorEnabled: account.twoFactorEnabled,
       sessions: sessions.map((s) => toSessionSummary(s, sessionId)),
       passkeys: await auth.listPasskeys(user.id),

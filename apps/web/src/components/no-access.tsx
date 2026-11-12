@@ -2,6 +2,8 @@ import type { RoleName } from "@ulixops/shared";
 import { Card, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 
 const ROLE_LABELS: Record<RoleName, string> = {
+  CLIENT_VIEWER: "Client Viewer",
+  SUPER_ADMIN: "Super Admin",
   ADMIN: "Admin",
   DEVELOPER: "Developer",
   VIEWER: "Viewer",

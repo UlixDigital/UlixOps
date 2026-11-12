@@ -15,6 +15,7 @@ import {
   siteActionPermission,
   SiteInventoryResult,
   type SiteJobView,
+  phpVersionCompare,
 } from "@ulixops/shared";
 import { type Request, type Response, Router } from "express";
 import { z } from "zod";
@@ -31,6 +32,7 @@ import {
 import { authorize, clientIpOf, permitted, sessionOf } from "../http/guard";
 import type { SecurityNotifier } from "../notify";
 import { type RunnerClient, RunnerJobFailedError, RunnerUnavailableError } from "../runner/client";
+import { afterInventoryChange } from "../vulnerabilities/service";
 
 export interface SiteOpsDeps {
   db: Db;
@@ -81,17 +83,46 @@ export function inventorySummary(inv: SiteInventory) {
     themeUpdates: items(inv.themes).filter((t) => t.updateVersion !== null).length,
     maintenance: inv.maintenance,
     safeMode: inv.safeMode,
+    coreUpdateVersion: inv.coreUpdateVersion,
+    updatesCheckedAt: inv.updatesCheckedAt?.toISOString() ?? null,
   };
 }
 
-function jobSummary(action: string, params: Prisma.JsonValue): string {
+/**
+ * Core-update fields to store with an inventory (A135): fresh after Check for updates; after a
+ * fast refresh, keep the last check unless core has since reached that version.
+ */
+export function coreUpdateFields(
+  result: { wpVersion: string; updatesChecked?: boolean; coreUpdateVersion?: string | null },
+  previous: { coreUpdateVersion: string | null; updatesCheckedAt: Date | null } | null,
+  at: Date,
+): { coreUpdateVersion: string | null; updatesCheckedAt: Date | null } {
+  if (result.updatesChecked)
+    return { coreUpdateVersion: result.coreUpdateVersion ?? null, updatesCheckedAt: at };
+  const kept =
+    previous?.coreUpdateVersion &&
+    phpVersionCompare(previous.coreUpdateVersion, result.wpVersion) > 0
+      ? previous.coreUpdateVersion
+      : null;
+  return { coreUpdateVersion: kept, updatesCheckedAt: previous?.updatesCheckedAt ?? null };
+}
+
+/** Short human summary of a site job, for the Logs tab and the "working on" banner. */
+export function jobSummary(action: string, params: Prisma.JsonValue): string {
   const p = (params ?? {}) as {
     plugin?: unknown;
     on?: unknown;
     emergency?: unknown;
     checkUpdates?: unknown;
+    includeDb?: unknown;
+    asset?: unknown;
+    fromVersion?: unknown;
+    toVersion?: unknown;
   };
   const plugin = typeof p.plugin === "string" ? p.plugin : "?";
+  const asset = p.asset === "theme" ? "theme" : "plugin";
+  const from = typeof p.fromVersion === "string" ? p.fromVersion : "?";
+  const to = typeof p.toVersion === "string" ? p.toVersion : "?";
   switch (action) {
     case "inventory.refresh":
       return p.checkUpdates === true ? "Check for updates" : "Refresh inventory";
@@ -103,6 +134,24 @@ function jobSummary(action: string, params: Prisma.JsonValue): string {
       return p.on === true ? "Maintenance mode on" : "Maintenance mode off";
     case "cache.flush":
       return "Flush cache";
+    case "snapshot.create":
+      return `Snapshot ${asset} ${plugin}${p.includeDb === true ? " + database" : ""}`;
+    case "snapshot.restore":
+      return `Restore snapshot of ${plugin}`;
+    case "plugin.update":
+      return `Update plugin ${plugin}`;
+    case "theme.update":
+      return `Update theme ${plugin}`;
+    case "plugin.delete":
+      return `Delete plugin ${plugin}`;
+    case "theme.delete":
+      return `Delete theme ${plugin}`;
+    case "core.update":
+      return `Update WordPress ${from} → ${to}`;
+    case "core.update-db":
+      return `WordPress database upgrade${to !== "?" ? ` (${to})` : ""}`;
+    case "core.rollback":
+      return `Roll back WordPress ${from} → ${to}`;
     default:
       return action;
   }
@@ -175,6 +224,8 @@ export function siteOpsRouter(deps: SiteOpsDeps): Router {
       warnings: inv.warnings,
       plugins: items(inv.plugins),
       themes: items(inv.themes),
+      coreUpdateVersion: inv.coreUpdateVersion,
+      updatesCheckedAt: inv.updatesCheckedAt?.toISOString() ?? null,
     };
   }
 
@@ -485,6 +536,7 @@ export function siteOpsRouter(deps: SiteOpsDeps): Router {
           warnings: result.warnings,
           plugins,
           themes,
+          ...coreUpdateFields(result, previous, now()),
         };
         stored = await db.siteInventory.upsert({
           where: { environmentId: env.id },
@@ -499,6 +551,7 @@ export function siteOpsRouter(deps: SiteOpsDeps): Router {
             wpCliVersion: result.wpCliVersion,
           },
         });
+        await afterInventoryChange(deps, env.id);
         const updates = plugins.filter((p) => p.updateVersion !== null).length;
         const lines = [
           checkUpdates

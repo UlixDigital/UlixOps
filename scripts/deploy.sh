@@ -62,14 +62,16 @@ remote "set -eu
   docker compose --env-file ~/ulixops.env -f docker-compose.yml -f docker-compose.prod.yml \
     up -d --build --remove-orphans
   # Runner/API run as uid 1000 (node). Named volumes are root-owned on first create;
-  # without this, snapshot writes fail with EACCES on /data/snapshots/quick (A100).
+  # without this, snapshot writes and visual checks fail with EACCES (A100, A163).
   # Must use a plain container: the runner service drops CAP_CHOWN and mounts plugins :ro.
   proj=\"\$(basename \"\$PWD\")\"
   docker run --rm \
     -v \"\${proj}_snapshot-store:/data/snapshots\" \
     -v \"\${proj}_plugin-store:/data/plugins\" \
+    -v \"\${proj}_visual-work:/visual-work\" \
+    -v \"\${proj}_visual-store:/data/visual\" \
     alpine:3.20 \
-    sh -c 'chown -R 1000:1000 /data/snapshots /data/plugins && chmod 750 /data/snapshots /data/plugins'
+    sh -c 'chown -R 1000:1000 /data/snapshots /data/plugins /visual-work /data/visual && chmod 750 /data/snapshots /data/plugins /visual-work /data/visual'
   docker compose --env-file ~/ulixops.env -f docker-compose.yml -f docker-compose.prod.yml ps"
 
 # First deploy only: claim the fresh vault and give the runner its machine identity. The vault

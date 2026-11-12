@@ -20,6 +20,8 @@ import type { RunnerClient } from "../runner/client";
 import { RunnerJobFailedError, RunnerUnavailableError } from "../runner/client";
 import { readRetentionDays } from "../snapshots/retention";
 import type { SnapshotStore } from "../snapshots/store";
+import { finishAfterVisualCheck, startBeforeVisualCheck } from "../visual/service";
+import type { VisualStore } from "../visual/store";
 
 const SNAPSHOT_TIMEOUT_MS = 120_000;
 const DEPLOY_TIMEOUT_MS = 120_000;
@@ -33,6 +35,8 @@ export interface OrchestratorDeps {
   snapshots: SnapshotStore;
   defaultRetentionDays: number;
   notifier?: SecurityNotifier;
+  /** Before/after screenshots around the deploy (A163). Optional for older tests. */
+  visualStore?: VisualStore;
 }
 
 const running = new Set<string>();
@@ -144,6 +148,7 @@ async function processDeployment(deps: OrchestratorDeps, deploymentId: string): 
           includeDb: deployment.pluginVersion.dbChanging,
           env: target.environment,
           siteId: target.siteId,
+          priorLog: target.log,
         });
 
         if (!outcome.ok && deployment.pauseOnFailure) {
@@ -191,6 +196,94 @@ async function processDeployment(deps: OrchestratorDeps, deploymentId: string): 
   }
 }
 
+const interruptedLine = (hasSnapshot: boolean) =>
+  `Interrupted by a hub restart: check the site${hasSnapshot ? " (its pre-deploy snapshot is in Backups)" : ""}, then Resume or Cancel.`;
+
+/**
+ * Runs once at API startup. The rollout loop lives in memory, so a restart strands QUEUED /
+ * RUNNING deployments. Pause them (never re-run on a live site unattended), mark targets that
+ * were mid-step, audit and alert so a person checks the site before resuming (A155).
+ */
+export async function recoverInterruptedDeployments(
+  deps: Pick<OrchestratorDeps, "db" | "now" | "notifier">,
+): Promise<number> {
+  const { db, now } = deps;
+  const stranded = await db.deployment.findMany({
+    where: { status: { in: ["QUEUED", "RUNNING"] } },
+    include: { pluginVersion: { include: { plugin: true } }, targets: true },
+  });
+  for (const deployment of stranded) {
+    const paused = await db.deployment.updateMany({
+      where: { id: deployment.id, status: { in: ["QUEUED", "RUNNING"] } },
+      data: { status: "PAUSED" },
+    });
+    if (paused.count !== 1) continue;
+    const midStep = deployment.targets.filter(
+      (t) => !isTerminal(t.status) && t.status !== "QUEUED" && t.status !== "PAUSED",
+    );
+    for (const target of midStep) {
+      await db.deploymentTarget.update({
+        where: { id: target.id },
+        data: {
+          status: "PAUSED",
+          log: `${target.log ? `${target.log}\n` : ""}${interruptedLine(Boolean(target.backupId))}`.slice(
+            -50_000,
+          ),
+        },
+      });
+    }
+    await db.deploymentTarget.updateMany({
+      where: { deploymentId: deployment.id, status: "QUEUED" },
+      data: { status: "PAUSED" },
+    });
+    // A quick snapshot the runner never answered for stays PENDING forever otherwise.
+    if (midStep.length > 0) {
+      await db.backup.updateMany({
+        where: {
+          kind: "QUICK_SNAPSHOT",
+          status: "PENDING",
+          environmentId: { in: midStep.map((t) => t.environmentId) },
+        },
+        data: { status: "FAILED" },
+      });
+    }
+    const name = `${deployment.pluginVersion.plugin.name} ${deployment.pluginVersion.version}`;
+    const siteIds = [...new Set(deployment.targets.map((t) => t.siteId))];
+    const midSiteIds = [...new Set(midStep.map((t) => t.siteId))];
+    await audit(
+      db,
+      {
+        userId: null,
+        action: "deployment.interrupted",
+        result: "alert",
+        siteIds,
+        meta: {
+          deploymentId: deployment.id,
+          title: `Deployment paused by hub restart: ${name}`,
+          midStepSites: midSiteIds,
+        },
+      },
+      now(),
+    );
+    if (deps.notifier?.notify) {
+      const admins = await adminUserIds(db);
+      await deps.notifier.notify({
+        kind: "deployment.failed",
+        title: `Deployment paused by hub restart: ${name}`,
+        body:
+          midSiteIds.length > 0
+            ? `The hub restarted while ${midSiteIds.length} site(s) were mid-deploy. Check them, then Resume or Cancel in Deployments.`
+            : "The hub restarted before the next site started. Resume or Cancel in Deployments.",
+        severity: midSiteIds.length > 0 ? "critical" : "warning",
+        siteIds: midSiteIds.length > 0 ? midSiteIds : siteIds,
+        recipientUserIds: [...new Set([...admins, deployment.requestedById])],
+        meta: { deploymentId: deployment.id },
+      });
+    }
+  }
+  return stranded.length;
+}
+
 function isTerminal(status: TargetStatus): boolean {
   return status === "DONE" || status === "FAILED" || status === "ROLLED_BACK";
 }
@@ -206,16 +299,18 @@ async function runTarget(
     includeDb: boolean;
     env: SiteEnvironment;
     siteId: string;
+    /** Log of an earlier, interrupted attempt; kept so a resumed target shows its history. */
+    priorLog: string;
   },
 ): Promise<{ ok: boolean; rolledBack?: boolean }> {
   const { db, now, runner } = deps;
-  const logs: string[] = [];
+  const logs: string[] = opts.priorLog ? [opts.priorLog, "Resumed."] : [];
   const append = async (line: string, status?: TargetStatus) => {
     logs.push(line);
     await db.deploymentTarget.update({
       where: { id: opts.targetId },
       data: {
-        log: logs.join("\n").slice(0, 50_000),
+        log: logs.join("\n").slice(-50_000),
         ...(status ? { status } : {}),
       },
     });
@@ -324,6 +419,46 @@ async function runTarget(
       return { ok: false };
     }
 
+    let visualCheckId = "";
+    if (deps.visualStore) {
+      await append("Capturing before screenshots…", "CHECKING");
+      try {
+        const site = await db.site.findUniqueOrThrow({
+          where: { id: opts.siteId },
+          select: { id: true, name: true, archived: true },
+        });
+        const before = await startBeforeVisualCheck(
+          {
+            db,
+            runner,
+            store: deps.visualStore,
+            notifier: deps.notifier,
+            now,
+          },
+          {
+            id: env.id,
+            kind: env.kind,
+            url: env.url,
+            sshHost: env.sshHost,
+            siteId: opts.siteId,
+            site,
+          },
+          {
+            trigger: "deploy",
+            deploymentId: opts.deploymentId,
+            deploymentTargetId: opts.targetId,
+          },
+        );
+        if (before.skipped) await append("Visual checks off — skipped before capture.");
+        else {
+          visualCheckId = before.checkId;
+          await append(`Before screenshots: ${before.detail}`);
+        }
+      } catch (error) {
+        await append(`Before screenshots error: ${errorMessage(error)}`);
+      }
+    }
+
     await append("Deploying plugin ZIP…", "DEPLOYING");
     try {
       const deployRaw = await runner.run(
@@ -365,7 +500,7 @@ async function runTarget(
     let healthOk = false;
     try {
       const origin = healthFetchOrigin(env.url, env.sshHost);
-      const urls = buildHealthUrls(origin, settings.extraPaths);
+      const urls = buildHealthUrls(origin, settings);
       const healthRaw = await runner.run(
         {
           type: "site.health",
@@ -395,6 +530,37 @@ async function runTarget(
     } catch (error) {
       await append(`Health check error: ${errorMessage(error)}`);
       healthOk = false;
+    }
+
+    if (visualCheckId && deps.visualStore) {
+      await append("Capturing after screenshots…", "CHECKING");
+      try {
+        const site = await db.site.findUniqueOrThrow({
+          where: { id: opts.siteId },
+          select: { id: true, name: true, archived: true },
+        });
+        const after = await finishAfterVisualCheck(
+          {
+            db,
+            runner,
+            store: deps.visualStore,
+            notifier: deps.notifier,
+            now,
+          },
+          {
+            id: env.id,
+            kind: env.kind,
+            url: env.url,
+            sshHost: env.sshHost,
+            siteId: opts.siteId,
+            site,
+          },
+          visualCheckId,
+        );
+        await append(`Visual check: ${after.status} — ${after.detail}`);
+      } catch (error) {
+        await append(`After screenshots error: ${errorMessage(error)}`);
+      }
     }
 
     if (healthOk) {

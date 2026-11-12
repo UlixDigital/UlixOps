@@ -56,7 +56,30 @@ export type EnrollStartResponse = z.infer<typeof EnrollStartResponse>;
 
 export const SetupInspectResponse = z.object({ email: z.string() });
 
-export const Role = z.enum(["ADMIN", "DEVELOPER", "VIEWER"]);
+export const Role = z.enum(["SUPER_ADMIN", "ADMIN", "DEVELOPER", "VIEWER", "CLIENT_VIEWER"]);
+
+/**
+ * Roles Admins may invite or assign (A134). SUPER_ADMIN is never inviteable — only a
+ * Super Admin may promote an existing Admin (with 2FA) via role change (A172), or via CLI.
+ */
+export const AssignableRole = z.enum(["ADMIN", "DEVELOPER", "VIEWER", "CLIENT_VIEWER"]);
+
+/** Roles a Super Admin may set on an existing user (includes promoting/demoting Super Admin). */
+export const SuperAssignableRole = z.enum([
+  "SUPER_ADMIN",
+  "ADMIN",
+  "DEVELOPER",
+  "VIEWER",
+  "CLIENT_VIEWER",
+]);
+
+/** Admins and Super Admins: "the team" for alerts, last-Admin protection and approvals. */
+export const ADMIN_ROLES = ["SUPER_ADMIN", "ADMIN"] as const;
+export const isAdminRole = (role: string): boolean =>
+  (ADMIN_ROLES as readonly string[]).includes(role);
+
+/** Tag-scoped read-only client (A178). */
+export const isClientViewer = (role: string): boolean => role === "CLIENT_VIEWER";
 
 export const SessionInfo = z.object({
   user: z.object({
@@ -64,6 +87,8 @@ export const SessionInfo = z.object({
     email: z.string(),
     name: z.string().nullable(),
     role: Role,
+    /** Set only for CLIENT_VIEWER: the single site tag they may see (A178). */
+    viewTag: z.string().nullable(),
   }),
   sessionId: z.string(),
   expiresAt: z.iso.datetime(),
@@ -88,9 +113,11 @@ export const AuthErrorCode = z.enum([
   "email_taken",
   "cannot_change_self",
   "last_admin",
+  "needs_admin_2fa",
   "invalid_entries",
   "would_lock_you_out",
   "already_pending",
+  "already_enabled",
   "bulk_update_active",
   "runner_unavailable",
   "runner_failed",
@@ -113,6 +140,37 @@ export const AuthErrorCode = z.enum([
   "version_exists",
   "upload_expired",
   "upload_invalid",
+  "sync_running",
+  "approval_required",
+  "invalid_key",
+  "vault_unavailable",
+  "still_active",
+  "scan_running",
+  "scan_pending",
+  "scan_finished",
+  "check_running",
+  "expiry_running",
+  "uptime_running",
+  "uptime_paused",
+  "backup_pending",
+  "backup_finished",
+  "drive_not_connected",
+  "backup_not_ready",
+  "confirm_mismatch",
+  "restore_pending",
+  "restore_started",
+  "site_address_invalid",
+  "logging_not_managed",
+  "dns_token_missing",
+  "dns_busy",
+  "dns_failed",
+  "record_outside_zone",
+  "record_not_managed",
+  "alert_state",
+  "smtp_not_configured",
+  "not_ready",
+  "no_recipients",
+  "send_failed",
 ]);
 export type AuthErrorCode = z.infer<typeof AuthErrorCode>;
 export const AuthError = z.object({ error: AuthErrorCode });

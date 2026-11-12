@@ -44,9 +44,10 @@ services:
       REDIS_URL: redis://:${REDIS_PASSWORD:?set REDIS_PASSWORD in .env}@redis:6379
       PLUGIN_STORE_DIR: /data/plugins
       SNAPSHOT_STORE_DIR: /data/snapshots
+      VISUAL_STORE_DIR: /data/visual
       SNAPSHOT_RETENTION_DAYS: ${SNAPSHOT_RETENTION_DAYS:-7}
     # Plugin ZIPs and encrypted snapshots, outside any web root (A63, A68).
-    volumes: [plugin-store:/data/plugins, snapshot-store:/data/snapshots]
+    volumes: [plugin-store:/data/plugins, snapshot-store:/data/snapshots, visual-store:/data/visual]
     tmpfs: [/tmp]
     networks: [app, db, queue]
     healthcheck:
@@ -96,12 +97,51 @@ services:
       SNAPSHOT_ENCRYPTION_KEY: ${SNAPSHOT_ENCRYPTION_KEY:?set SNAPSHOT_ENCRYPTION_KEY in .env}
       # Registry ZIPs, read-only (A63 / A81). The API writes; the runner only reads.
       PLUGIN_STORE_DIR: /data/plugins
-    volumes: [snapshot-store:/data/snapshots, plugin-store:/data/plugins:ro]
+      # Site copies handed to the scanner sidecar (A138).
+      SCAN_WORK_DIR: /scan-work
+      # Playwright sidecar handshake + PNG store (A163).
+      VISUAL_WORK_DIR: /visual-work
+      VISUAL_STORE_DIR: /data/visual
+    volumes:
+      [
+        snapshot-store:/data/snapshots,
+        plugin-store:/data/plugins:ro,
+        scan-work:/scan-work,
+        visual-work:/visual-work,
+        visual-store:/data/visual,
+      ]
     tmpfs: [/tmp]
     networks: [queue, egress, vault]
     depends_on:
       redis: { condition: service_healthy }
       infisical: { condition: service_healthy }
+
+  # Malware scanner (A140): ClamAV + YARA webshell rules. Reads site copies the runner leaves in
+  # scan-work and writes results back. No database, queue, vault or site access; egress only for
+  # ClamAV signature updates.
+  scanner:
+    <<: *hardened
+    build: { context: ., dockerfile: docker/scanner/Dockerfile }
+    # clamscan loads the whole ClamAV database (~1-1.5 GB); cap it so a scan can never starve
+    # the hub. Out of memory fails that scan only (A140).
+    mem_limit: 2g
+    # ClamAV signatures (~300 MB) persist in scanner-cache between restarts.
+    volumes: [scan-work:/work, scanner-cache:/home/scanner]
+    tmpfs: [/tmp]
+    networks: [egress]
+
+  # Visual checks (A163): Playwright Chromium. Takes screenshots of public pages the runner
+  # lists in visual-work; writes PNGs to visual-store. No vault, DB, Redis or SSH.
+  visual:
+    <<: *hardened
+    build: { context: ., dockerfile: docker/visual/Dockerfile }
+    mem_limit: 1536m
+    shm_size: 256m
+    volumes: [visual-work:/work, visual-store:/data/visual]
+    tmpfs:
+      - /tmp
+      - /home/pwuser:uid=1000,gid=1000
+    networks: [egress]
 
   postgres:
     image: postgres:17-alpine
@@ -301,6 +341,10 @@ volumes:
   pgdata: {}
   plugin-store: {}
   snapshot-store: {}
+  scan-work: {}
+  scanner-cache: {}
+  visual-work: {}
+  visual-store: {}
   redisdata: {}
   testwp-db: {}
   testwp-html: {}

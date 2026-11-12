@@ -11,24 +11,43 @@ import { credentialsRouter } from "./credentials/routes";
 import { deploymentsRouter, onDeployBulkDecided } from "./deployments/routes";
 import { authenticate, sessionOf } from "./http/guard";
 import { notificationsRouter } from "./notifications/routes";
+import { trackingRouter } from "./alerts/tracking";
 import { logNotifier, type SecurityNotifier } from "./notify";
 import type { RunnerClient } from "./runner/client";
 import { internalRouter, settingsRouter } from "./settings/routes";
 import { pluginsRouter } from "./plugins/routes";
 import type { PluginStore } from "./plugins/store";
 import { healthSiteRouter } from "./health/routes";
+import { autoUpdatesRouter, siteAutoUpdateRouter } from "./autoupdates/routes";
 import { onBulkUpdateApproved } from "./snapshots/bulk-update-run";
 import { backupsRouter, snapshotSiteRouter } from "./snapshots/routes";
 import type { SnapshotStore } from "./snapshots/store";
+import { siteFilesRouter } from "./sites/files";
 import { siteOpsRouter } from "./sites/operations";
 import { sitesRouter } from "./sites/routes";
 import { usersRouter } from "./users/routes";
+import { siteVulnerabilitiesRouter, vulnerabilitiesRouter } from "./vulnerabilities/routes";
+import { malwareRouter, siteMalwareRouter } from "./malware/routes";
+import { integrityRouter, siteIntegrityRouter } from "./integrity/routes";
+import { onRestoreDecided } from "./full-backups/restore";
+import { fullBackupsRouter, siteBackupRouter } from "./full-backups/routes";
+import { monitoringRouter, siteMonitoringRouter } from "./monitoring/routes";
+import { dnsRouter } from "./dns/routes";
+import { errorLogRouter, siteErrorLogRouter } from "./errorlog/routes";
+import { enableLoggingBulk } from "./errorlog/service";
+import { onDnsRollbackDecided } from "./dns/service";
+import { siteVisualRouter, visualRouter } from "./visual/routes";
+import type { VisualStore } from "./visual/store";
+import type { Mailer } from "./notifications/channels";
+import { reportsRouter } from "./reports/routes";
 
 export interface AppDeps {
   auth?: AuthService;
   db?: Db;
   now?: () => Date;
   notifier?: SecurityNotifier;
+  /** Optional SMTP mailer for monthly report PDFs (A164). */
+  mailer?: Mailer | null;
   /** Keys setup-link tokens; the same SESSION_SECRET the AuthService uses. */
   sessionSecret?: string;
   publicUrl?: string;
@@ -40,6 +59,8 @@ export interface AppDeps {
   pluginStore?: PluginStore;
   /** Encrypted quick snapshots on disk (step 8); API deletes expired files only. */
   snapshotStore?: SnapshotStore;
+  /** Before/after PNGs for visual checks (A163). */
+  visualStore?: VisualStore;
   defaultRetentionDays?: number;
 }
 
@@ -50,6 +71,7 @@ const SIGNED_IN_PATHS = [
   "/settings",
   "/audit",
   "/alerts",
+  "/alert-tracking",
   "/sites",
   "/credentials",
   "/approvals",
@@ -57,6 +79,15 @@ const SIGNED_IN_PATHS = [
   "/backups",
   "/deployments",
   "/notifications",
+  "/vulnerabilities",
+  "/malware-scans",
+  "/integrity-checks",
+  "/full-backups",
+  "/monitoring",
+  "/visual-checks",
+  "/dns",
+  "/auto-updates",
+  "/reports",
 ];
 
 export function createApp(deps: AppDeps = {}) {
@@ -74,7 +105,8 @@ export function createApp(deps: AppDeps = {}) {
       frameguard: { action: "deny" },
     }),
   );
-  app.use(express.json({ limit: "100kb" }));
+  // 2 MiB so site file-manager writes (A179, ≤ 1 MiB payload + base64) fit; other routes stay Zod-capped.
+  app.use(express.json({ limit: "2mb" }));
 
   app.get("/healthz", (_req, res) => {
     res.json({ status: "ok" });
@@ -123,6 +155,7 @@ export function createApp(deps: AppDeps = {}) {
     );
     app.use("/audit", auditRouter(guarded));
     app.use("/alerts", alertsRouter(guarded));
+    app.use("/alert-tracking", trackingRouter(guarded));
     app.use(
       "/notifications",
       notificationsRouter({
@@ -135,15 +168,67 @@ export function createApp(deps: AppDeps = {}) {
     );
     if (deps.pluginStore)
       app.use("/plugins", pluginsRouter({ ...guarded, store: deps.pluginStore }));
+    app.use(
+      "/reports",
+      reportsRouter({
+        db,
+        now,
+        notifier,
+        mailer: deps.mailer ?? null,
+      }),
+    );
     if (deps.runner) {
       const siteDeps = { ...guarded, runner: deps.runner, notifier };
-      app.use("/sites", sitesRouter(siteDeps), siteOpsRouter(siteDeps), healthSiteRouter(siteDeps));
-      app.use("/credentials", credentialsRouter({ ...guarded, runner: deps.runner }));
+      app.use(
+        "/sites",
+        sitesRouter(siteDeps),
+        siteOpsRouter(siteDeps),
+        healthSiteRouter(siteDeps),
+        siteVulnerabilitiesRouter(siteDeps),
+        siteMalwareRouter(siteDeps),
+        siteIntegrityRouter(siteDeps),
+        siteBackupRouter(siteDeps),
+        siteMonitoringRouter(siteDeps),
+        siteErrorLogRouter(siteDeps),
+        siteFilesRouter(siteDeps),
+        siteAutoUpdateRouter({ ...siteDeps, visualStore: deps.visualStore }),
+      );
+      if (deps.visualStore)
+        app.use(
+          "/sites",
+          siteVisualRouter({
+            ...siteDeps,
+            store: deps.visualStore,
+            now: deps.now ?? (() => new Date()),
+          }),
+        );
+      app.use("/auto-updates", autoUpdatesRouter({ ...siteDeps, visualStore: deps.visualStore }));
+      app.use(
+        "/full-backups",
+        fullBackupsRouter({ ...siteDeps, publicUrl: deps.publicUrl ?? "http://localhost:3000" }),
+      );
+      app.use("/malware-scans", malwareRouter(siteDeps));
+      app.use("/integrity-checks", integrityRouter(siteDeps));
+      app.use("/monitoring/php-errors", errorLogRouter(siteDeps));
+      app.use("/monitoring", monitoringRouter(siteDeps));
+      if (deps.visualStore)
+        app.use(
+          "/visual-checks",
+          visualRouter({
+            ...siteDeps,
+            store: deps.visualStore,
+            now: deps.now ?? (() => new Date()),
+          }),
+        );
+      app.use("/dns", dnsRouter(siteDeps));
+      app.use("/vulnerabilities", vulnerabilitiesRouter(siteDeps));
+      app.use("/credentials", credentialsRouter({ ...guarded, runner: deps.runner, notifier }));
       if (deps.snapshotStore) {
         const snapDeps = {
           ...siteDeps,
           snapshots: deps.snapshotStore,
           defaultRetentionDays: deps.defaultRetentionDays ?? 7,
+          visualStore: deps.visualStore,
         };
         app.use("/sites", snapshotSiteRouter(snapDeps));
         app.use("/backups", backupsRouter(snapDeps));
@@ -153,6 +238,7 @@ export function createApp(deps: AppDeps = {}) {
           snapshots: deps.snapshotStore,
           defaultRetentionDays: deps.defaultRetentionDays ?? 7,
           notifier,
+          visualStore: deps.visualStore,
         };
         app.use("/deployments", deploymentsRouter(deployDeps));
         app.use(
@@ -162,6 +248,12 @@ export function createApp(deps: AppDeps = {}) {
             notifier,
             onDeployBulkDecided: (decision, deploymentId, decidedById) =>
               onDeployBulkDecided(deployDeps, decision, deploymentId, decidedById),
+            onRestoreDecided: (decision, restoreId, decidedById) =>
+              onRestoreDecided(siteDeps, decision, restoreId, decidedById),
+            onDnsRollbackDecided: (decision, rollbackId, decidedById) =>
+              onDnsRollbackDecided(siteDeps, decision, rollbackId, decidedById),
+            onDebugLogBulkApproved: (ids, requestedById) =>
+              void enableLoggingBulk(siteDeps, ids, requestedById),
             onBulkUpdateApproved: (payload, decidedById, requestId, requesterId) => {
               const parsed = payload as {
                 siteId?: string;
@@ -195,7 +287,19 @@ export function createApp(deps: AppDeps = {}) {
           }),
         );
       } else {
-        app.use("/approvals", approvalsRouter({ ...guarded, notifier }));
+        app.use(
+          "/approvals",
+          approvalsRouter({
+            ...guarded,
+            notifier,
+            onRestoreDecided: (decision, restoreId, decidedById) =>
+              onRestoreDecided(siteDeps, decision, restoreId, decidedById),
+            onDnsRollbackDecided: (decision, rollbackId, decidedById) =>
+              onDnsRollbackDecided(siteDeps, decision, rollbackId, decidedById),
+            onDebugLogBulkApproved: (ids, requestedById) =>
+              void enableLoggingBulk(siteDeps, ids, requestedById),
+          }),
+        );
       }
     } else {
       app.use("/approvals", approvalsRouter({ ...guarded, notifier }));

@@ -69,7 +69,7 @@ export async function apiGet<S extends z.ZodType>(
 
 /** POST/PATCH/PUT for the signed-in user (Server Actions). */
 export async function apiSend<S extends z.ZodType>(
-  method: "POST" | "PATCH" | "PUT",
+  method: "POST" | "PATCH" | "PUT" | "DELETE",
   path: string,
   body: unknown,
   schema: S,
@@ -84,7 +84,7 @@ export async function apiSend<S extends z.ZodType>(
         "x-ulix-client-ip": auth.ip,
         "content-type": "application/json",
       },
-      body: JSON.stringify(body),
+      body: method === "DELETE" ? undefined : JSON.stringify(body),
       cache: "no-store",
       signal: AbortSignal.timeout(options.timeoutMs ?? 5000),
     });

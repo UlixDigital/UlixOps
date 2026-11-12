@@ -32,6 +32,7 @@ describe("runner loadEnv", () => {
       SNAPSHOT_STORE_DIR: "/data/snapshots",
       SNAPSHOT_ENCRYPTION_KEY: "ab".repeat(32),
       PLUGIN_STORE_DIR: "/data/plugins",
+      SCAN_WORK_DIR: "/scan-work",
     });
   });
 

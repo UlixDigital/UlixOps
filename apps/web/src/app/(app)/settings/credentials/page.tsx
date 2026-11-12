@@ -1,6 +1,6 @@
 // Vault credentials (spec 5 and screen 22): SSH key names, age and rotation reminders. Key
 // material never reaches this page; a new key's public half is shown once after creating it.
-import { can, CredentialList, ROTATION_DAYS } from "@ulixops/shared";
+import { ApiKeyStatus, can, CredentialList, ROTATION_DAYS } from "@ulixops/shared";
 import type { Metadata } from "next";
 import Link from "next/link";
 import { ActionForm } from "@/components/action-form";
@@ -15,19 +15,28 @@ import { formatUtc } from "@/lib/format";
 import { ENV_LABELS } from "@/lib/site-status";
 import { cn } from "@/lib/utils";
 import { createCredentialAction } from "../actions";
+import { ApiKeyCard } from "./api-key-card";
 
 export const metadata: Metadata = { title: "Credentials · UlixOps" };
 
 export default async function CredentialsPage() {
   const { user } = await requireSession();
   if (!can(user.role, "secrets.manage")) return <NoAccess role={user.role} what="credentials" />;
+  const auth = await apiAuth();
   // Null when the runner or the vault can't be reached (including a timeout).
-  const credentials = await apiGet("/credentials", CredentialList, await apiAuth(), {
-    timeoutMs: 15_000,
-  }).then(
-    (res) => (res.ok ? res.data.credentials : null),
-    () => null,
-  );
+  const keyStatus = (name: string) =>
+    apiGet(`/credentials/api-keys/${name}`, ApiKeyStatus, auth, { timeoutMs: 15_000 }).then(
+      (res) => (res.ok ? res.data : null),
+      () => null,
+    );
+  const [credentials, wordfence, cloudflare] = await Promise.all([
+    apiGet("/credentials", CredentialList, auth, { timeoutMs: 15_000 }).then(
+      (res) => (res.ok ? res.data.credentials : null),
+      () => null,
+    ),
+    keyStatus("wordfence_api_key"),
+    keyStatus("cloudflare_api_token"),
+  ]);
   const due = credentials?.filter((c) => c.rotationDue) ?? [];
 
   return (
@@ -63,6 +72,26 @@ export default async function CredentialsPage() {
           </ActionForm>
         </CardContent>
       </Card>
+
+      <ApiKeyCard
+        status={wordfence}
+        title="Wordfence Intelligence API key"
+        description="Lets UlixOps download the Wordfence vulnerability feed for the Security page. Nothing is installed on the sites. Get a free key at wordfence.com → Account → Integrations."
+      />
+
+      <ApiKeyCard
+        status={cloudflare}
+        title="Cloudflare API token"
+        description="Lets UlixOps read and change DNS records and purge the cache on the DNS page. Create it in Cloudflare (logged in as the Ulix Digital user that can see the client domains): My Profile → API Tokens → Create Token → Custom token. Permissions: Zone · Zone · Read, Zone · DNS · Edit, Zone · Cache Purge · Purge. Zone Resources: Include · All zones from an account (repeat the row for each client account), or Specific zones. No other permissions. Client domains in another Cloudflare account appear once that account invites the Ulix Digital user as a member."
+      />
+
+      <p className="text-sm text-muted-foreground">
+        Google Drive backups (client ID, secret, backup key and sign-in) are under{" "}
+        <Link href="/settings/google-drive" className="text-link hover:underline">
+          Settings → Google Drive
+        </Link>
+        .
+      </p>
 
       <section className="grid gap-3">
         <h2 className="text-base font-semibold">SSH keys in the vault</h2>

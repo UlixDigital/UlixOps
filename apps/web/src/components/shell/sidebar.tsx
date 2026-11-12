@@ -3,6 +3,7 @@ import { PanelLeftClose, PanelLeftOpen } from "lucide-react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { useState } from "react";
+import { BrandLogo } from "@/components/brand-logo";
 import type { NavItem } from "@/lib/nav";
 import { SIDEBAR_COOKIE } from "@/lib/ui-prefs";
 import { cn } from "@/lib/utils";
@@ -78,14 +79,16 @@ export function NavList({
   return (
     <nav aria-label="Main" className="grid gap-6">
       <ul className="grid gap-0.5">{main.map(row)}</ul>
-      <div className="grid gap-1">
-        {!collapsed && (
-          <p className="px-2.5 text-[11px] font-medium tracking-wide text-sidebar-foreground/50 uppercase">
-            Later phases
-          </p>
-        )}
-        <ul className="grid gap-0.5">{later.map(row)}</ul>
-      </div>
+      {later.length > 0 ? (
+        <div className="grid gap-1">
+          {!collapsed && (
+            <p className="px-2.5 text-[11px] font-medium tracking-wide text-sidebar-foreground/50 uppercase">
+              Later phases
+            </p>
+          )}
+          <ul className="grid gap-0.5">{later.map(row)}</ul>
+        </div>
+      ) : null}
     </nav>
   );
 }
@@ -109,14 +112,17 @@ export function Sidebar({
   return (
     <aside
       className={cn(
-        "sticky top-0 hidden h-dvh shrink-0 flex-col border-r border-sidebar-border bg-sidebar text-sidebar-foreground transition-[width] duration-150 md:flex",
-        collapsed ? "w-14" : "w-60",
+        "sticky top-0 hidden h-dvh shrink-0 flex-col border-r border-sidebar-border bg-sidebar-brand text-sidebar-foreground transition-[width] duration-150 md:flex",
+        collapsed ? "w-16" : "w-64",
       )}
     >
-      <div className={cn("flex h-14 items-center px-4", collapsed && "justify-center px-0")}>
-        <Link href="/" className="text-sm font-semibold tracking-tight" title="UlixOps">
-          {collapsed ? "U" : "UlixOps"}
-        </Link>
+      <div
+        className={cn(
+          "flex h-16 shrink-0 items-center px-3",
+          collapsed && "justify-center px-0",
+        )}
+      >
+        <BrandLogo compact={collapsed} priority />
       </div>
       <div className="flex-1 overflow-y-auto px-2 py-2">
         <NavList main={main} later={later} collapsed={collapsed} />

@@ -1,11 +1,12 @@
 // File transfer over SSH exec when the SFTP subsystem is unavailable (WP Engine SSH Gateway, A99).
-// Uses path-validated argv only: test/mkdir/mv/rm/cat/dd/tar — never a free-form shell string.
+// Uses path-validated argv only: test/mkdir/mv/rm/cat/head/tail/dd/tar — never a free-form shell string.
 import type { Client } from "ssh2";
 import {
   MAX_SFTP_FILE_BYTES,
   MAX_SFTP_FILES,
   MAX_SFTP_TOTAL_BYTES,
   shellQuote,
+  type SftpDirEntry,
   type SftpFile,
   type SftpSession,
 } from "./ssh";
@@ -34,6 +35,20 @@ export class ShellFs implements SftpSession {
       });
     }
     if (result.stdout.length > maxBytes) throw new Error(`Remote file exceeds ${maxBytes} bytes`);
+    return result.stdout;
+  }
+
+  async readFileHead(remotePath: string, maxBytes = MAX_SFTP_FILE_BYTES): Promise<Buffer> {
+    const path = safePath(remotePath);
+    // `head -c` reads the first N bytes; available on WP Engine's sandbox (A170).
+    const result = await this.execBinary(["head", "-c", String(maxBytes), path], {
+      maxStdout: maxBytes,
+    });
+    if (result.exitCode !== 0) {
+      throw Object.assign(new Error(result.stderr || `head exit ${result.exitCode}`), {
+        code: "ENOENT",
+      });
+    }
     return result.stdout;
   }
 
@@ -68,6 +83,41 @@ export class ShellFs implements SftpSession {
     const path = safePath(remotePath);
     const result = await this.execText(["mkdir", "-p", "--", path]);
     if (result.exitCode !== 0) throw new Error(result.stderr || `mkdir exit ${result.exitCode}`);
+  }
+
+  async listDir(remotePath: string): Promise<SftpDirEntry[]> {
+    const path = safePath(remotePath);
+    // One argv round trip only — never `sh -c` (WP Engine wraps exec and breaks $1) (A180).
+    let listed = await this.execText([
+      "/bin/ls",
+      "-la",
+      "--time-style=+%s",
+      "--color=never",
+      "--",
+      path,
+    ]);
+    if (listed.exitCode !== 0)
+      listed = await this.execText(["/bin/ls", "-la", "--color=never", "--", path]);
+    if (listed.exitCode !== 0) listed = await this.execText(["/bin/ls", "-la", "--", path]);
+    if (listed.exitCode !== 0) listed = await this.execText(["ls", "-la", "--", path]);
+    if (listed.exitCode !== 0) throw new Error(listed.stderr || `ls exit ${listed.exitCode}`);
+    const parsed = parseLsLong(listed.stdout);
+    if (parsed.length > 0 || /\btotal\s+0\b/i.test(listed.stdout)) return parsed;
+    const namesOnly = await this.execText(["/bin/ls", "-1A", "--color=never", "--", path]);
+    const names =
+      namesOnly.exitCode === 0
+        ? namesOnly
+        : await this.execText(["/bin/ls", "-1A", "--", path]);
+    if (names.exitCode !== 0) throw new Error(names.stderr || `ls exit ${names.exitCode}`);
+    const out: SftpDirEntry[] = [];
+    for (const raw of names.stdout.split("\n")) {
+      const name = cleanListingName(raw);
+      if (!name) continue;
+      if (name.includes("..") || name.includes("/") || name.includes("\0"))
+        throw new Error(`Refused remote name: ${name}`);
+      out.push({ name, isDirectory: false, isFile: true, size: 0, mtime: null });
+    }
+    return out;
   }
 
   async readTree(remoteDir: string): Promise<SftpFile[]> {
@@ -210,4 +260,62 @@ function safePath(remotePath: string): string {
     throw new Error(`Refused remote path: ${remotePath}`);
   }
   return remotePath;
+}
+
+/** Strip ANSI colour and CR so aliased/coloured ls output still yields real names. */
+function cleanListingName(line: string): string {
+  return line
+    .replace(/\u001b\[[0-9;]*m/g, "")
+    .replace(/\r/g, "")
+    .trim();
+}
+
+/**
+ * Parse `ls -la` / `ls -la --time-style=+%s` lines into directory entries.
+ * Exported for unit tests.
+ */
+export function parseLsLong(stdout: string): SftpDirEntry[] {
+  const out: SftpDirEntry[] = [];
+  // perm links owner group size [mtime-or-date…] name
+  // With --time-style=+%s, mtime is one integer field; without it, date can be 2–3 fields —
+  // so take size as field 5 and name as everything after the last size match via regex.
+  const epochLine =
+    /^([dl\-])\S*\s+\d+\s+\S+\s+\S+\s+(\d+)\s+(\d+)\s+(\S.*)$/;
+  const dateLine =
+    /^([dl\-])\S*\s+\d+\s+\S+\s+\S+\s+(\d+)\s+\S+\s+\S+\s+(?:\d{4}|\d{1,2}:\d{2})\s+(\S.*)$/;
+  for (const raw of stdout.split("\n")) {
+    const line = cleanListingName(raw);
+    if (!line || line.startsWith("total ")) continue;
+    let kindChar = "";
+    let size = 0;
+    let mtime: number | null = null;
+    let name = "";
+    const withEpoch = epochLine.exec(line);
+    if (withEpoch) {
+      kindChar = withEpoch[1] ?? "";
+      size = Number.parseInt(withEpoch[2] ?? "0", 10);
+      mtime = Number.parseInt(withEpoch[3] ?? "", 10);
+      name = withEpoch[4] ?? "";
+    } else {
+      const withDate = dateLine.exec(line);
+      if (!withDate) continue;
+      kindChar = withDate[1] ?? "";
+      size = Number.parseInt(withDate[2] ?? "0", 10);
+      name = withDate[3] ?? "";
+    }
+    name = name.replace(/ -> .*$/, ""); // symlink target
+    if (!name || name === "." || name === "..") continue;
+    if (name.includes("/") || name.includes("\0") || name.includes(".."))
+      throw new Error(`Refused remote name: ${name}`);
+    const isDirectory = kindChar === "d";
+    const isFile = kindChar === "-";
+    out.push({
+      name,
+      isDirectory,
+      isFile,
+      size: Number.isFinite(size) ? size : 0,
+      mtime: mtime !== null && Number.isFinite(mtime) ? mtime : null,
+    });
+  }
+  return out;
 }

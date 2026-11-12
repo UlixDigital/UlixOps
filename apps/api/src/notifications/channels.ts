@@ -1,10 +1,18 @@
 // Email (SMTP) and Slack webhook delivery. Failures are logged; callers must not throw upward.
 import nodemailer from "nodemailer";
 
+export interface MailAttachment {
+  filename: string;
+  content: Buffer;
+  contentType: string;
+}
+
 export interface MailMessage {
   to: string[];
   subject: string;
   text: string;
+  /** Optional binary attachments (monthly report PDFs, A164). */
+  attachments?: MailAttachment[];
 }
 
 export interface Mailer {
@@ -49,6 +57,11 @@ export function createSmtpMailer(smtpUrl: string, from: string): Mailer | null {
         to: message.to.join(", "),
         subject: message.subject,
         text: message.text,
+        attachments: message.attachments?.map((a) => ({
+          filename: a.filename,
+          content: a.content,
+          contentType: a.contentType,
+        })),
       });
     },
   };

@@ -21,7 +21,13 @@ import { apiAuth } from "@/lib/auth";
 import { setFlash } from "@/lib/flash";
 import { errorMessage } from "@/lib/messages";
 
-const ROLE_LABELS = { ADMIN: "Admin", DEVELOPER: "Developer", VIEWER: "Viewer" } as const;
+const ROLE_LABELS = {
+  SUPER_ADMIN: "Super Admin",
+  ADMIN: "Admin",
+  DEVELOPER: "Developer",
+  VIEWER: "Viewer",
+  CLIENT_VIEWER: "Client Viewer",
+} as const;
 const UserResponse = z.object({ user: UserDetail.shape.user });
 
 function field(form: FormData, name: string): string {
@@ -43,10 +49,18 @@ async function done(message: string, path: string): Promise<ActionState> {
 export async function inviteUserAction(_prev: ActionState, form: FormData): Promise<ActionState> {
   const role = Role.safeParse(field(form, "role"));
   if (!role.success) return { error: "Choose a role." };
+  const viewTag = field(form, "viewTag") || undefined;
+  if (role.data === "CLIENT_VIEWER" && !viewTag)
+    return { error: "Client Viewer needs a site tag." };
   const res = await apiSend(
     "POST",
     "/users",
-    { email: field(form, "email"), name: field(form, "name") || undefined, role: role.data },
+    {
+      email: field(form, "email"),
+      name: field(form, "name") || undefined,
+      role: role.data,
+      ...(role.data === "CLIENT_VIEWER" ? { viewTag } : {}),
+    },
     InviteUserResponse,
     await apiAuth(),
   );
@@ -64,10 +78,16 @@ export async function changeRoleAction(_prev: ActionState, form: FormData): Prom
   const id = userId(form);
   const role = Role.safeParse(field(form, "role"));
   if (!id || !role.success) return { error: "Choose a role." };
+  const viewTag = field(form, "viewTag") || undefined;
+  if (role.data === "CLIENT_VIEWER" && !viewTag)
+    return { error: "Client Viewer needs a site tag." };
   const res = await apiSend(
     "PATCH",
     `/users/${id}`,
-    { role: role.data },
+    {
+      role: role.data,
+      viewTag: role.data === "CLIENT_VIEWER" ? viewTag : null,
+    },
     UserResponse,
     await apiAuth(),
   );

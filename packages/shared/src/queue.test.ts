@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { CredentialRef, RunnerJob, SshTarget } from "./queue";
+import { CredentialRef, queueForJob, RunnerJob, SshTarget, VISUAL_QUEUE } from "./queue";
 
 const target = {
   host: "clientsite.ssh.wpengine.net",
@@ -68,5 +68,21 @@ describe("runner jobs", () => {
     expect(CredentialRef.safeParse("SSH_KEY_ULIX_FORMS").success).toBe(true);
     expect(CredentialRef.safeParse("ssh_key").success).toBe(false);
     expect(CredentialRef.safeParse("X").success).toBe(false);
+  });
+
+  it("routes visual captures to visual-ops", () => {
+    const job = {
+      type: "site.visual.capture" as const,
+      checkId: "abc123",
+      mode: "before" as const,
+      pages: [{ path: "/", url: "https://example.com/", role: "home" as const }],
+      sshHost: "example.com",
+      viewportWidth: 1280,
+      viewportHeight: 720,
+      maxDiffPercent: 1,
+      pixelThreshold: 0.1,
+    };
+    expect(RunnerJob.safeParse(job).success).toBe(true);
+    expect(queueForJob(job.type)).toBe(VISUAL_QUEUE);
   });
 });

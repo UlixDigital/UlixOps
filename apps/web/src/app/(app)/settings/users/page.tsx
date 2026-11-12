@@ -3,8 +3,8 @@ import { ActionForm } from "@/components/action-form";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { RoleOptions, Select } from "@/components/ui/select";
 import { inviteUserAction } from "../actions";
+import { RoleTagFields } from "./role-tag-fields";
 import { UsersPageClient } from "./users-page-client";
 
 export const metadata: Metadata = { title: "Users & roles · UlixOps" };
@@ -18,7 +18,7 @@ export default function UsersPage() {
           <CardTitle className="text-base">Invite someone</CardTitle>
           <CardDescription>
             UlixOps creates a one-time setup link (24 hours). Send it to them privately; they choose
-            a password and set up 2FA. Email delivery arrives in Build Order step 11.
+            a password and set up 2FA. UlixOps doesn't email the link itself.
           </CardDescription>
         </CardHeader>
         <CardContent>
@@ -27,21 +27,18 @@ export default function UsersPage() {
             submitLabel="Create invite"
             linkNote="Setup link: send it to them privately. It works once, for 24 hours."
           >
-            <div className="grid gap-3 sm:grid-cols-3">
-              <div className="grid gap-1.5">
-                <Label htmlFor="invite-email">Email</Label>
-                <Input id="invite-email" name="email" type="email" required />
+            <div className="grid gap-3">
+              <div className="grid gap-3 sm:grid-cols-2">
+                <div className="grid gap-1.5">
+                  <Label htmlFor="invite-email">Email</Label>
+                  <Input id="invite-email" name="email" type="email" required />
+                </div>
+                <div className="grid gap-1.5">
+                  <Label htmlFor="invite-name">Name (optional)</Label>
+                  <Input id="invite-name" name="name" maxLength={100} />
+                </div>
               </div>
-              <div className="grid gap-1.5">
-                <Label htmlFor="invite-name">Name (optional)</Label>
-                <Input id="invite-name" name="name" maxLength={100} />
-              </div>
-              <div className="grid gap-1.5">
-                <Label htmlFor="invite-role">Role</Label>
-                <Select id="invite-role" name="role" defaultValue="VIEWER">
-                  <RoleOptions />
-                </Select>
-              </div>
+              <RoleTagFields idPrefix="invite" defaultRole="VIEWER" />
             </div>
           </ActionForm>
         </CardContent>

@@ -19,12 +19,27 @@ describe("HealthPath", () => {
 });
 
 describe("buildHealthUrls", () => {
-  it("always includes home and wp-admin, dedupes extras", () => {
-    expect(buildHealthUrls("https://example.test", ["/", "/shop/", "/wp-admin/"])).toEqual([
+  it("checks the homepage only by default, dedupes extras", () => {
+    expect(
+      buildHealthUrls("https://example.test", { extraPaths: ["/", "/shop/"], checkWpAdmin: false }),
+    ).toEqual(["https://example.test/", "https://example.test/shop/"]);
+  });
+
+  it("adds wp-admin only when it is switched on (A151)", () => {
+    expect(
+      buildHealthUrls("https://example.test", {
+        extraPaths: ["/shop/", "/wp-admin/"],
+        checkWpAdmin: true,
+      }),
+    ).toEqual([
       "https://example.test/",
       "https://example.test/wp-admin/",
       "https://example.test/shop/",
     ]);
+  });
+
+  it("defaults stored settings without the flag to off", () => {
+    expect(HealthCheckSettings.parse({ thresholdMs: 5_000 }).checkWpAdmin).toBe(false);
   });
 });
 
@@ -87,6 +102,7 @@ describe("HealthCheckSettings", () => {
       extraPaths: [],
       thresholdMs: 5_000,
       checkErrorLog: true,
+      checkWpAdmin: false,
     });
   });
 });

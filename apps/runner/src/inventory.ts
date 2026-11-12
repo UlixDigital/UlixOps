@@ -3,6 +3,8 @@
 // WP-CLI, the lists are read again with plugins and themes skipped (agent decision A54).
 import {
   type Command,
+  CoreVersion,
+  phpVersionCompare,
   type InventoryItem,
   MAX_INVENTORY_ITEMS,
   type SiteInventoryResult,
@@ -58,11 +60,12 @@ export async function readInventory(
   // plugin code (that was timing out at 30s on slow PHP 7.4 WP Engine installs).
   // Check for updates still loads plugins first (update info), then falls back to safe (A54).
   const listSafeFirst = !checkUpdates;
-  const [core, pluginsFirst, themesFirst, maintenanceCheck] = await Promise.all([
+  const [core, pluginsFirst, themesFirst, maintenanceCheck, coreUpdate] = await Promise.all([
     run({ op: "core.version" }),
     list(run, "plugin.list", listSafeFirst, checkUpdates),
     list(run, "theme.list", listSafeFirst, checkUpdates),
     readMaintenance(session, target, run, clean),
+    checkUpdates ? readCoreUpdate(run, clean) : Promise.resolve({ version: null, warning: null }),
   ]);
 
   const wpVersion = core.stdout.trim();
@@ -94,6 +97,7 @@ export async function readInventory(
   }
   if (!themes.ok) warnings.push(clean(`Themes could not be listed: ${themes.error}`));
   warnings.push(...maintenanceCheck.warnings);
+  if (coreUpdate.warning) warnings.push(coreUpdate.warning);
   if (!checkUpdates) {
     warnings.push("Update availability was not checked (use Check for updates).");
   }
@@ -114,7 +118,35 @@ export async function readInventory(
     safeMode,
     warnings: warnings.slice(0, 10),
     durationMs: now() - started,
+    updatesChecked: checkUpdates,
+    coreUpdateVersion: coreUpdate.version,
   };
+}
+
+const CoreUpdates = z.array(z.object({ version: z.string(), update_type: z.string().nullish() }));
+
+/** Newest WordPress release `wp core check-update` offers (A135); null when current. */
+async function readCoreUpdate(
+  run: (
+    command: Command,
+    timeoutMs?: number,
+  ) => Promise<{ exitCode: number; stdout: string; stderr: string }>,
+  clean: (text: string, max?: number) => string,
+): Promise<{ version: string | null; warning: string | null }> {
+  const out = await run({ op: "core.check-update" }, 60_000);
+  if (out.exitCode !== 0)
+    return {
+      version: null,
+      warning: clean(`WordPress core update check failed: ${out.stderr || out.stdout}`),
+    };
+  // WP-CLI prints nothing (or a "Success: WordPress is at the latest version." line) when current.
+  const parsed = CoreUpdates.safeParse(parseJsonArray(out.stdout) ?? []);
+  if (!parsed.success) return { version: null, warning: null };
+  const offered = parsed.data
+    .map((u) => u.version.trim())
+    .filter((v) => CoreVersion.safeParse(v).success)
+    .sort(phpVersionCompare);
+  return { version: offered.at(-1) ?? null, warning: null };
 }
 
 async function readMaintenance(

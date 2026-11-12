@@ -1,10 +1,6 @@
 // Notification events, channel prefs, and in-app alert centre contracts (Build Order step 11).
 import { z } from "zod";
 
-// Local id schema — do not import RecordId from ./users (users imports this module for SettingsView).
-const id = z.string().regex(/^[a-z0-9]{1,64}$/);
-const iso = z.iso.datetime();
-
 /** Events that can be emailed / posted to Slack (spec §6.8). In-app rows are always written. */
 export const NotificationEvent = z.enum([
   "security.NEW_DEVICE_LOGIN",
@@ -17,8 +13,29 @@ export const NotificationEvent = z.enum([
   "deployment.failed",
   "deployment.rolled_back",
   "approval.requested",
+  "approval.self_approved",
   "bulk_update.failed",
   "bulk_update.completed",
+  "vulnerability.found",
+  "malware.found",
+  "integrity.changed",
+  "backup.failed",
+  "backup.skipped",
+  "restore.succeeded",
+  "restore.failed",
+  "ssl.expiring",
+  "ssl.invalid",
+  "domain.expiring",
+  "uptime.down",
+  "uptime.up",
+  "dns.changed",
+  "php.fatal",
+  "php.logging",
+  "autoupdate.completed",
+  "autoupdate.problems",
+  "visual.changed",
+  "visual.failed",
+  "report.ready",
 ]);
 export type NotificationEvent = z.infer<typeof NotificationEvent>;
 
@@ -35,8 +52,29 @@ export const NOTIFICATION_EVENT_LABELS: Record<NotificationEvent, string> = {
   "deployment.failed": "Deployment failed",
   "deployment.rolled_back": "Automatic rollback after failed health check",
   "approval.requested": "Approval requested",
+  "approval.self_approved": "A Super Admin approved their own risky action",
   "bulk_update.failed": "Bulk plugin/theme update failed",
   "bulk_update.completed": "Bulk plugin/theme update completed",
+  "vulnerability.found": "New vulnerability found on a site",
+  "malware.found": "Malware scan found infected files",
+  "integrity.changed": "WordPress or plugin files changed",
+  "backup.failed": "Google Drive backup failed",
+  "backup.skipped": "Backup skipped: the site wasn't healthy",
+  "restore.succeeded": "Site restored from a Google Drive backup",
+  "restore.failed": "Restore from a Google Drive backup failed",
+  "ssl.expiring": "SSL certificate expires soon",
+  "ssl.invalid": "SSL certificate problem (untrusted, wrong name or unreachable)",
+  "domain.expiring": "Domain registration expires soon",
+  "uptime.down": "Site down (two failed uptime checks in a row)",
+  "uptime.up": "Site back up after downtime",
+  "dns.changed": "Cloudflare DNS records changed outside UlixOps",
+  "php.fatal": "New PHP fatal error in a site's error log",
+  "php.logging": "PHP error logging switched on for several sites",
+  "autoupdate.completed": "Scheduled updates installed",
+  "autoupdate.problems": "Scheduled updates rolled back, failed or skipped",
+  "visual.changed": "Site pages look different after a deploy or update",
+  "visual.failed": "Visual check could not take screenshots",
+  "report.ready": "Monthly client report is ready",
 };
 
 export const NotificationSeverity = z.enum(["info", "warning", "critical"]);
@@ -103,24 +141,6 @@ export function mergeNotificationPrefs(raw: unknown): NotificationPrefs {
     slack: mergeChannel(defaults.slack, obj.slack),
   };
 }
-
-export const NotificationView = z.object({
-  id,
-  kind: NotificationEvent,
-  title: z.string(),
-  body: z.string(),
-  severity: NotificationSeverity,
-  siteIds: z.array(id),
-  readAt: iso.nullable(),
-  createdAt: iso,
-});
-export type NotificationView = z.infer<typeof NotificationView>;
-
-export const NotificationList = z.object({
-  notifications: z.array(NotificationView),
-  unreadCount: z.number().int().nonnegative(),
-});
-export type NotificationList = z.infer<typeof NotificationList>;
 
 export const NotificationPrefsView = z.object({
   prefs: NotificationPrefs,

@@ -20,6 +20,8 @@ COPY apps/web/package.json apps/web/
 COPY packages/shared/package.json packages/shared/
 RUN pnpm install --prod --frozen-lockfile --filter @ulixops/runner
 COPY --from=build /repo/apps/runner/dist apps/runner/dist
+# Shared with the scanner sidecar (A138); created here so the volume starts owned by node.
+RUN mkdir -p /scan-work && chown node:node /scan-work
 WORKDIR /repo/apps/runner
 USER node
 CMD ["node", "dist/index.js"]

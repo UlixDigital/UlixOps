@@ -8,6 +8,8 @@ export interface Vault {
   /** Names and dates only: values are never fetched for a listing. */
   list(): Promise<CredentialInfo[]>;
   create(name: string, value: string, comment: string): Promise<void>;
+  /** Overwrites an existing secret's value (integration API keys, A133). */
+  replace(name: string, value: string): Promise<void>;
 }
 
 export class VaultError extends Error {
@@ -130,6 +132,17 @@ export class InfisicalVault implements Vault {
     }
     if (!res.ok) throw new VaultError(`Vault write failed (HTTP ${res.status})`, "unavailable");
   }
+
+  async replace(name: string, value: string): Promise<void> {
+    const ref = CredentialRef.parse(name);
+    const { projectId, environment, secretPath } = this.config;
+    const res = await this.request(`/api/v4/secrets/${ref}`, {
+      method: "PATCH",
+      body: JSON.stringify({ projectId, environment, secretPath, secretValue: value }),
+    });
+    if (res.status === 404) throw new VaultError(`"${ref}" is not in the vault`, "not_found");
+    if (!res.ok) throw new VaultError(`Vault write failed (HTTP ${res.status})`, "unavailable");
+  }
 }
 
 /** In-memory vault for tests. */
@@ -153,6 +166,11 @@ export class MemoryVault implements Vault {
   async create(name: string, value: string): Promise<void> {
     if (this.secrets.has(name))
       throw new VaultError(`"${name}" already exists in the vault`, "exists");
+    this.secrets.set(name, { value, at: new Date().toISOString() });
+  }
+
+  async replace(name: string, value: string): Promise<void> {
+    if (!this.secrets.has(name)) throw new VaultError(`"${name}" is not in the vault`, "not_found");
     this.secrets.set(name, { value, at: new Date().toISOString() });
   }
 }

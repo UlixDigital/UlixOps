@@ -130,7 +130,13 @@ describe.runIf(DATABASE_URL)("auth flows (Postgres)", () => {
     });
     expect(confirm.status).toBe(200);
     const session = await post("/session", { sessionToken: confirm.body.sessionToken });
-    expect(session.body.user).toEqual({ id: user.id, email: EMAIL, name: null, role: "ADMIN" });
+    expect(session.body.user).toEqual({
+      id: user.id,
+      email: EMAIL,
+      name: null,
+      role: "ADMIN",
+      viewTag: null,
+    });
 
     expect((await post("/setup/inspect", { setupToken: token })).status).toBe(410);
     expect(alerts).toEqual([]);

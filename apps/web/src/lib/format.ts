@@ -1,4 +1,10 @@
-export const ROLE_LABELS = { ADMIN: "Admin", DEVELOPER: "Developer", VIEWER: "Viewer" } as const;
+export const ROLE_LABELS = {
+  SUPER_ADMIN: "Super Admin",
+  ADMIN: "Admin",
+  DEVELOPER: "Developer",
+  VIEWER: "Viewer",
+  CLIENT_VIEWER: "Client Viewer",
+} as const;
 
 /** "2026-10-29 14:05 UTC": one unambiguous time for a team across time zones. */
 export function formatUtc(iso: string | null | undefined): string {

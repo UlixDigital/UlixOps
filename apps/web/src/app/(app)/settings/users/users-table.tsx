@@ -23,7 +23,12 @@ const columns: ColumnDef<UserSummary>[] = [
       </Link>
     ),
   },
-  { id: "role", header: "Role", accessorFn: (u) => ROLE_LABELS[u.role] },
+  {
+    id: "role",
+    header: "Role",
+    accessorFn: (u) =>
+      u.viewTag ? `${ROLE_LABELS[u.role]} (${u.viewTag})` : ROLE_LABELS[u.role],
+  },
   {
     id: "status",
     header: "Status",

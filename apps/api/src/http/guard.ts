@@ -28,7 +28,10 @@ export function authenticate(auth: AuthService) {
       res.status(401).json({ error: "session_invalid" });
       return;
     }
-    const result = await auth.validateSession(token);
+    // The web app marks background polls as passive: they must not reset the idle timer.
+    const result = await auth.validateSession(token, {
+      touch: req.get("x-ulix-passive") !== "1",
+    });
     if (!result.ok) {
       res.status(401).json({ error: result.error });
       return;

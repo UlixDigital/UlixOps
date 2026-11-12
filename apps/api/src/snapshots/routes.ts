@@ -20,12 +20,18 @@ import {
   SiteInventoryResult,
   UpdatePluginRequest,
   UpdateThemeRequest,
+  type SiteJobView,
+  UpdateCoreRequest,
+  DeletePluginRequest,
+  DeleteThemeRequest,
+  type CoreUpdateResponse,
+  CoreVersion,
   versionJumpSafety,
   BulkUpdateRunProgress,
 } from "@ulixops/shared";
 import { type Request, type Response, Router } from "express";
 import { z } from "zod";
-import { requestApproval } from "../approvals/routes";
+import { requestApproval, selfApproveIfAllowed } from "../approvals/routes";
 import { raiseAlert } from "../alerts";
 import { audit } from "../audit";
 import type { Db } from "../db";
@@ -39,13 +45,24 @@ import {
 import { authorize, clientIpOf, permitted, sessionOf } from "../http/guard";
 import type { SecurityNotifier } from "../notify";
 import { type RunnerClient, RunnerJobFailedError, RunnerUnavailableError } from "../runner/client";
-import { items } from "../sites/operations";
-import { executeBulkUpdateRun, type BulkPlannedItem } from "./bulk-update-run";
+import { coreUpdateFields, items, jobSummary } from "../sites/operations";
+import {
+  type BulkPlannedItem,
+  executeBulkUpdateRun,
+  onBulkUpdateApproved,
+  runHealth,
+} from "./bulk-update-run";
+import type { VisualStore } from "../visual/store";
 import { purgeExpired, readRetentionDays } from "./retention";
 import type { SnapshotStore } from "./store";
+import { afterInventoryChange } from "../vulnerabilities/service";
 
 const SNAPSHOT_TIMEOUT_MS = 180_000;
-const UPDATE_TIMEOUT_MS = 120_000;
+/** How long a finished bulk update report stays on the Plugins & themes tab (A136). */
+const REPORT_KEEP_MS = 24 * 60 * 60_000;
+// The runner's own cap is 300 s; on top come the SSH Gateway connect and a busy runner queue
+// (A136: Elementor timed out here at 330 s while the update itself was still running).
+const UPDATE_TIMEOUT_MS = 420_000;
 const MAX_OUTPUT = 20_000;
 
 export interface SnapshotDeps {
@@ -56,6 +73,8 @@ export interface SnapshotDeps {
   snapshots: SnapshotStore;
   /** Fallback when the Setting row is missing (SNAPSHOT_RETENTION_DAYS). */
   defaultRetentionDays: number;
+  /** Before/after screenshots around bulk updates (A163). */
+  visualStore?: VisualStore;
 }
 
 export function snapshotSiteRouter(deps: SnapshotDeps): Router {
@@ -643,6 +662,7 @@ export function snapshotSiteRouter(deps: SnapshotDeps): Router {
         warnings: result.warnings,
         plugins: result.plugins,
         themes: result.themes,
+        ...coreUpdateFields(result, null, now()),
       };
       await db.siteInventory.upsert({
         where: { environmentId: env.id },
@@ -657,6 +677,7 @@ export function snapshotSiteRouter(deps: SnapshotDeps): Router {
           wpCliVersion: result.wpCliVersion,
         },
       });
+      await afterInventoryChange(deps, env.id);
       await audit(
         db,
         {
@@ -729,6 +750,271 @@ export function snapshotSiteRouter(deps: SnapshotDeps): Router {
     } finally {
       await release(env.id, token);
     }
+  });
+
+  /**
+   * WordPress core update (A135): exact version the last update check offered → database
+   * upgrade → health check → on failure, downgrade to the previous version and check again.
+   * Core files are restored by re-installing the old release (no file snapshot of core).
+   */
+  router.post("/:id/environments/:kind/core/update", async (req, res) => {
+    const body = UpdateCoreRequest.safeParse(req.body);
+    const kind = EnvKind.safeParse(String(req.params.kind ?? "").toUpperCase());
+    if (!body.success || !kind.success) {
+      res.status(400).json({ error: "bad_request" });
+      return;
+    }
+    if (!(await permitted(req, res, siteActionPermission("core.update", kind.data), deps))) return;
+    const found = await load(req, res);
+    if (!found) return;
+    const { site, env } = found;
+    if (!(await ready(res, site, env)) || !pinned(env)) return;
+
+    const inv = await db.siteInventory.findUnique({ where: { environmentId: env.id } });
+    if (!inv?.coreUpdateVersion) {
+      res.status(409).json({ error: "no_update_available" });
+      return;
+    }
+    // Only the release the user saw: anything else means the page is out of date.
+    if (inv.coreUpdateVersion !== body.data.version) {
+      res.status(409).json({ error: "out_of_date" });
+      return;
+    }
+    const fromVersion = inv.wpVersion;
+    const toVersion = body.data.version;
+    const canRollBack = CoreVersion.safeParse(fromVersion).success;
+
+    const token = await claim(env.id);
+    if (!token) {
+      res.status(409).json({ error: "site_busy" });
+      return;
+    }
+    const jobs: z.infer<typeof CoreUpdateResponse>["jobs"] = [];
+    const runCore = async (
+      action: string,
+      command: { op: "core.update"; version: string; force?: boolean } | { op: "core.update-db" },
+      params: Prisma.InputJsonObject,
+    ) => {
+      const ran = await runRemoteJob(
+        req,
+        site,
+        env,
+        action,
+        params,
+        () =>
+          deps.runner.run(
+            { type: "remote.command", target: targetOf(env), command },
+            UPDATE_TIMEOUT_MS,
+          ),
+        async (raw) => {
+          const out = RemoteCommandResult.parse(raw);
+          if (out.hostKeyMismatch)
+            return {
+              ok: false,
+              exitCode: null,
+              output:
+                "Refused: the server's SSH host key no longer matches the pinned one, so nothing ran. Admins were alerted.",
+              hostKeyMismatch: true,
+            };
+          return {
+            ok: out.exitCode === 0,
+            exitCode: out.exitCode,
+            output: [out.stdout.trim(), out.stderr.trim()].filter(Boolean).join("\n"),
+            hostKeyMismatch: false,
+          };
+        },
+      );
+      if (ran.job) jobs.push(ran.job);
+      return ran.job?.status === "SUCCEEDED" && !ran.hostKeyMismatch;
+    };
+    const health = async () => {
+      try {
+        return await runHealth(deps, env);
+      } catch {
+        return { ok: false, summary: "The health check could not run." };
+      }
+    };
+    const finish = async (status: z.infer<typeof CoreUpdateResponse>["status"], detail: string) => {
+      await refreshInventoryLocked(req, site, env);
+      await audit(
+        db,
+        {
+          userId: sessionOf(req).user.id,
+          action: "site.core.update.result",
+          result: status === "updated" ? "success" : "failure",
+          ip: clientIpOf(req),
+          siteIds: [site.id],
+          meta: { kind: env.kind, fromVersion, toVersion, status },
+        },
+        now(),
+      );
+      if (status !== "updated" && deps.notifier.notify)
+        await deps.notifier.notify({
+          kind: status === "failed" ? "bulk_update.failed" : "deployment.rolled_back",
+          title:
+            status === "rolled_back"
+              ? `WordPress update rolled back on ${site.name}`
+              : `WordPress update failed on ${site.name}`,
+          body: `${site.name} (${env.kind.toLowerCase()}): WordPress ${fromVersion} → ${toVersion}. ${detail}`,
+          severity: status === "rollback_failed" ? "critical" : "warning",
+          siteIds: [site.id],
+        });
+      const out: z.infer<typeof CoreUpdateResponse> = {
+        status,
+        fromVersion,
+        toVersion,
+        detail: detail.slice(0, 2000),
+        jobs,
+      };
+      res.json(out);
+    };
+
+    try {
+      if (
+        !(await runCore(
+          "core.update",
+          { op: "core.update", version: toVersion },
+          { fromVersion, toVersion },
+        ))
+      ) {
+        await finish(
+          "failed",
+          "WP-CLI could not update WordPress; nothing was changed. See the job log.",
+        );
+        return;
+      }
+      // Major releases need the database upgrade; on minor ones it is a quick no-op.
+      await runCore("core.update-db", { op: "core.update-db" }, { toVersion });
+      const after = await health();
+      if (after.ok) {
+        await finish("updated", `Healthy on WordPress ${toVersion}. ${after.summary}`);
+        return;
+      }
+      if (!canRollBack) {
+        await finish(
+          "rollback_failed",
+          `Health check failed (${after.summary}) and ${fromVersion} can't be re-installed automatically. Check the site now.`,
+        );
+        return;
+      }
+      const restored = await runCore(
+        "core.rollback",
+        { op: "core.update", version: fromVersion, force: true },
+        { fromVersion: toVersion, toVersion: fromVersion, reason: "health check failed" },
+      );
+      const again = restored ? await health() : { ok: false, summary: "rollback failed" };
+      await finish(
+        restored && again.ok ? "rolled_back" : "rollback_failed",
+        restored && again.ok
+          ? `Health check failed on ${toVersion} (${after.summary}); WordPress ${fromVersion} was re-installed and the site is healthy again.`
+          : `Health check failed on ${toVersion} (${after.summary}) and the rollback to ${fromVersion} did not bring it back (${again.summary}). Check the site now: Emergency tab.`,
+      );
+    } finally {
+      await release(env.id, token);
+    }
+  });
+
+  /**
+   * Delete an inactive plugin or theme (A137): snapshot its folder first (restorable from
+   * Snapshots & backups), then `wp plugin|theme delete`, then re-read the inventory.
+   */
+  async function deleteAsset(req: Request, res: Response, asset: SnapshotAsset, name: string) {
+    const kind = EnvKind.safeParse(String(req.params.kind ?? "").toUpperCase());
+    if (!kind.success) {
+      res.status(400).json({ error: "bad_request" });
+      return;
+    }
+    const action = asset === "theme" ? ("theme.delete" as const) : ("plugin.delete" as const);
+    if (!(await permitted(req, res, siteActionPermission(action, kind.data), deps))) return;
+    const found = await load(req, res);
+    if (!found) return;
+    const { site, env } = found;
+    if (!(await ready(res, site, env)) || !pinned(env)) return;
+
+    const inv = await db.siteInventory.findUnique({ where: { environmentId: env.id } });
+    const list = items((asset === "theme" ? inv?.themes : inv?.plugins) ?? []);
+    const item = list.find((i) => i.name === name);
+    if (!item) {
+      res
+        .status(404)
+        .json({ error: asset === "theme" ? "theme_not_in_inventory" : "plugin_not_in_inventory" });
+      return;
+    }
+    // Active, network-active, parent-of-active, must-use and drop-ins are never deleted here.
+    if (item.status !== "inactive") {
+      res.status(409).json({ error: "still_active" });
+      return;
+    }
+
+    const token = await claim(env.id);
+    if (!token) {
+      res.status(409).json({ error: "site_busy" });
+      return;
+    }
+    try {
+      const snap = await createSnapshot(req, site, env, name, false, asset);
+      let deleted: { job: SiteJobView | null; hostKeyMismatch: boolean } | null = null;
+      if (snap.job?.status === "SUCCEEDED" && !snap.hostKeyMismatch) {
+        deleted = await runRemoteJob(
+          req,
+          site,
+          env,
+          action,
+          { plugin: name, asset, version: item.version, backupId: snap.backup?.id ?? null },
+          () =>
+            deps.runner.run({
+              type: "remote.command",
+              target: targetOf(env),
+              command: { op: action, slug: name },
+            }),
+          async (raw) => {
+            const out = RemoteCommandResult.parse(raw);
+            if (out.hostKeyMismatch)
+              return {
+                ok: false,
+                exitCode: null,
+                output:
+                  "Refused: the server's SSH host key no longer matches the pinned one, so nothing ran. Admins were alerted.",
+                hostKeyMismatch: true,
+              };
+            return {
+              ok: out.exitCode === 0,
+              exitCode: out.exitCode,
+              output: [out.stdout.trim(), out.stderr.trim()].filter(Boolean).join("\n"),
+              hostKeyMismatch: false,
+            };
+          },
+        );
+        if (deleted.job?.status === "SUCCEEDED") await refreshInventoryLocked(req, site, env);
+      }
+      const body: z.infer<typeof PluginUpdateResponse> = {
+        job: snap.job,
+        hostKeyMismatch: deleted?.hostKeyMismatch ?? snap.hostKeyMismatch,
+        backup: snap.backup,
+        updateJob: deleted?.job ?? null,
+      };
+      res.json(body);
+    } finally {
+      await release(env.id, token);
+    }
+  }
+
+  router.post("/:id/environments/:kind/plugins/delete", async (req, res) => {
+    const body = DeletePluginRequest.safeParse(req.body);
+    if (!body.success) {
+      res.status(400).json({ error: "bad_request" });
+      return;
+    }
+    await deleteAsset(req, res, "plugin", body.data.plugin);
+  });
+
+  router.post("/:id/environments/:kind/themes/delete", async (req, res) => {
+    const body = DeleteThemeRequest.safeParse(req.body);
+    if (!body.success) {
+      res.status(400).json({ error: "bad_request" });
+      return;
+    }
+    await deleteAsset(req, res, "theme", body.data.theme);
   });
 
   router.post("/:id/environments/:kind/themes/update", async (req, res) => {
@@ -891,6 +1177,14 @@ export function snapshotSiteRouter(deps: SnapshotDeps): Router {
         res.status(409).json({ error: "bulk_update_active" });
         return;
       }
+      const { user } = sessionOf(req);
+      const items = planned.map((p) => ({
+        asset: p.asset,
+        name: p.name,
+        version: p.version,
+        updateVersion: p.updateVersion,
+        safety: p.safety,
+      }));
       const asked = await requestApproval(
         db,
         {
@@ -908,8 +1202,9 @@ export function snapshotSiteRouter(deps: SnapshotDeps): Router {
             })),
             runStatus: "queued",
           },
-          requestedById: sessionOf(req).user.id,
+          requestedById: user.id,
           ip: clientIpOf(req),
+          requesterRole: user.role,
         },
         now(),
         deps.notifier,
@@ -918,9 +1213,28 @@ export function snapshotSiteRouter(deps: SnapshotDeps): Router {
         res.status(409).json({ error: asked.error });
         return;
       }
+      // A Super Admin's request is approved at once and the run starts in the background (A134).
+      const selfApproved = await selfApproveIfAllowed(
+        {
+          db,
+          now,
+          notifier: deps.notifier,
+          onBulkUpdateApproved: (_payload, decidedById, requestId, requesterId) =>
+            onBulkUpdateApproved(
+              deps,
+              { siteId: site.id, kind: kind.data, items },
+              decidedById,
+              requestId,
+              requesterId,
+            ),
+        },
+        asked.id,
+        user,
+        clientIpOf(req),
+      );
       const out: z.infer<typeof BulkUpdateResponse> = {
         approvalId: asked.id,
-        status: "pending_approval",
+        status: selfApproved ? "running" : "pending_approval",
         results: [],
         inventoryRefreshed: false,
       };
@@ -941,6 +1255,51 @@ export function snapshotSiteRouter(deps: SnapshotDeps): Router {
   });
 
   /** Live / recent bulk-update progress for the plugins page poller (A108). */
+  /** Hide the last finished bulk report on this environment (A136). */
+  router.post("/:id/environments/:kind/bulk-update/dismiss", async (req, res) => {
+    const kind = EnvKind.safeParse(String(req.params.kind ?? "").toUpperCase());
+    if (!kind.success) {
+      res.status(400).json({ error: "bad_request" });
+      return;
+    }
+    if (!(await permitted(req, res, "sites.refresh", deps))) return;
+    const found = await load(req, res);
+    if (!found) return;
+    const recent = await db.approvalRequest.findFirst({
+      where: {
+        action: "site.bulk_update",
+        status: "APPROVED",
+        AND: [
+          { payload: { path: ["siteId"], equals: found.site.id } },
+          { payload: { path: ["kind"], equals: kind.data } },
+        ],
+      },
+      orderBy: { decidedAt: "desc" },
+    });
+    const payload = (recent?.payload ?? {}) as Prisma.JsonObject;
+    if (!recent || (payload.runStatus !== "completed" && payload.runStatus !== "failed")) {
+      res.status(404).json({ error: "not_found" });
+      return;
+    }
+    await db.approvalRequest.update({
+      where: { id: recent.id },
+      data: { payload: { ...payload, dismissedAt: now().toISOString() } },
+    });
+    await audit(
+      db,
+      {
+        userId: sessionOf(req).user.id,
+        action: "site.bulk_update.dismiss",
+        result: "success",
+        ip: clientIpOf(req),
+        siteIds: [found.site.id],
+        meta: { kind: kind.data, requestId: recent.id },
+      },
+      now(),
+    );
+    res.json({ ok: true });
+  });
+
   router.get("/:id/environments/:kind/bulk-update/status", canView, async (req, res) => {
     const kind = EnvKind.safeParse(String(req.params.kind ?? "").toUpperCase());
     if (!kind.success) {
@@ -1001,8 +1360,30 @@ export function snapshotSiteRouter(deps: SnapshotDeps): Router {
       runStatus?: string;
       runProgress?: unknown;
       reportMarkdown?: unknown;
+      dismissedAt?: unknown;
     };
     const runStatusRaw = payload.runStatus;
+    // A finished report stays until dismissed, or for REPORT_KEEP_MS after the run (A136).
+    if (runStatusRaw === "completed" || runStatusRaw === "failed") {
+      const progress = BulkUpdateRunProgress.safeParse(payload.runProgress);
+      const finishedAt = progress.success
+        ? Date.parse(progress.data.updatedAt)
+        : (recent.decidedAt?.getTime() ?? 0);
+      if (
+        typeof payload.dismissedAt === "string" ||
+        now().getTime() - finishedAt > REPORT_KEEP_MS
+      ) {
+        const empty: BulkUpdateStatusResponse = {
+          active: false,
+          approvalId: null,
+          runStatus: null,
+          progress: null,
+          reportMarkdown: null,
+        };
+        res.json(empty);
+        return;
+      }
+    }
     const runStatus =
       runStatusRaw === "queued" ||
       runStatusRaw === "running" ||
@@ -1129,27 +1510,4 @@ export function backupsRouter(deps: SnapshotDeps): Router {
   });
 
   return router;
-}
-
-function jobSummary(action: string, params: Prisma.JsonValue): string {
-  const p = (params ?? {}) as {
-    plugin?: unknown;
-    includeDb?: unknown;
-    backupId?: unknown;
-    asset?: unknown;
-  };
-  const plugin = typeof p.plugin === "string" ? p.plugin : "?";
-  const asset = p.asset === "theme" ? "theme" : "plugin";
-  switch (action) {
-    case "snapshot.create":
-      return `Snapshot ${asset} ${plugin}${p.includeDb === true ? " + database" : ""}`;
-    case "snapshot.restore":
-      return `Restore snapshot of ${plugin}`;
-    case "plugin.update":
-      return `Update plugin ${plugin}`;
-    case "theme.update":
-      return `Update theme ${plugin}`;
-    default:
-      return action;
-  }
 }

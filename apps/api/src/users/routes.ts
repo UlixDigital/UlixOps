@@ -1,5 +1,12 @@
 // Users & roles (spec screen 21): invite, change role, deactivate, reset 2FA, sessions.
-import { InviteUserRequest, RecordId, UpdateUserRequest } from "@ulixops/shared";
+import {
+  AssignableRole,
+  InviteUserRequest,
+  RecordId,
+  UpdateUserRequest,
+  ADMIN_ROLES,
+  isAdminRole,
+} from "@ulixops/shared";
 import { type Request, type Response, Router } from "express";
 import { raiseAlert } from "../alerts";
 import { audit } from "../audit";
@@ -68,6 +75,15 @@ export function usersRouter(deps: UsersDeps): Router {
     if (!user) fail(res, 404, "not_found");
     return user;
   }
+  /** A user to change. Only a Super Admin may change a Super Admin (A134). */
+  async function targetToChange(req: Request, res: Response): Promise<User | null> {
+    const user = await target(req, res);
+    if (user?.role === "SUPER_ADMIN" && sessionOf(req).user.role !== "SUPER_ADMIN") {
+      fail(res, 403, "forbidden");
+      return null;
+    }
+    return user;
+  }
   async function sessionCount(userId: string) {
     return db.session.count({ where: { userId, ...liveSessions(now()) } });
   }
@@ -96,10 +112,19 @@ export function usersRouter(deps: UsersDeps): Router {
       }
     }
     const user = await db.user.create({
-      data: { email: body.data.email, name: body.data.name || null, role: body.data.role },
+      data: {
+        email: body.data.email,
+        name: body.data.name || null,
+        role: body.data.role,
+        viewTag: body.data.role === "CLIENT_VIEWER" ? (body.data.viewTag ?? null) : null,
+      },
     });
     const link = await setupLink(user.id);
-    await record(req, "user.invite", user.id, { email: user.email, role: user.role });
+    await record(req, "user.invite", user.id, {
+      email: user.email,
+      role: user.role,
+      ...(user.viewTag ? { viewTag: user.viewTag } : {}),
+    });
     if (user.role === "ADMIN") await alert(req, "ADMIN_ROLE_GRANTED", user.id);
     res.status(201).json({ user: toUserSummary(user, 0), ...link });
   });
@@ -123,26 +148,57 @@ export function usersRouter(deps: UsersDeps): Router {
       fail(res, 400, "bad_request");
       return;
     }
-    const user = await target(req, res);
+    const user = await targetToChange(req, res);
     if (!user) return;
-    const { role, active, name } = body.data;
+    const actor = sessionOf(req).user;
+    const { role, active, name, viewTag } = body.data;
     const roleChanges = role !== undefined && role !== user.role;
     const activeChanges = active !== undefined && active !== user.active;
+    const nextRole = role ?? user.role;
+    // Client Viewer always stores exactly one tag; every other role clears it (A178).
+    const nextViewTag =
+      nextRole === "CLIENT_VIEWER"
+        ? (viewTag !== undefined ? viewTag : user.viewTag)
+        : null;
+    if (nextRole === "CLIENT_VIEWER" && !nextViewTag) {
+      fail(res, 400, "bad_request");
+      return;
+    }
+    const viewTagChanges = nextViewTag !== user.viewTag;
 
     // Admins cannot lock themselves out; another Admin has to do it.
-    if (user.id === sessionOf(req).user.id && (roleChanges || activeChanges)) {
-      {
-        fail(res, 409, "cannot_change_self");
+    if (user.id === actor.id && (roleChanges || activeChanges)) {
+      fail(res, 409, "cannot_change_self");
+      return;
+    }
+
+    // Super Admin assign/remove: only a Super Admin; promote only from Admin with 2FA (A172).
+    if (roleChanges && role === "SUPER_ADMIN") {
+      if (actor.role !== "SUPER_ADMIN") {
+        fail(res, 403, "forbidden");
+        return;
+      }
+      if (user.role !== "ADMIN" || !user.twoFactorEnabled) {
+        fail(res, 409, "needs_admin_2fa");
         return;
       }
     }
+    if (roleChanges && role !== undefined && role !== "SUPER_ADMIN") {
+      // Regular Admins may only assign inviteable roles; demoting a Super Admin is Super-only
+      // (already enforced by targetToChange when the target is SUPER_ADMIN).
+      if (actor.role !== "SUPER_ADMIN" && !AssignableRole.safeParse(role).success) {
+        fail(res, 403, "forbidden");
+        return;
+      }
+    }
+
     const losesAdmin =
-      user.role === "ADMIN" &&
+      isAdminRole(user.role) &&
       user.active &&
-      ((roleChanges && role !== "ADMIN") || active === false);
+      ((roleChanges && !isAdminRole(role)) || active === false);
     if (losesAdmin) {
       const otherAdmins = await db.user.count({
-        where: { role: "ADMIN", active: true, id: { not: user.id } },
+        where: { role: { in: [...ADMIN_ROLES] }, active: true, id: { not: user.id } },
       });
       if (otherAdmins === 0) {
         fail(res, 409, "last_admin");
@@ -156,6 +212,7 @@ export function usersRouter(deps: UsersDeps): Router {
         ...(roleChanges ? { role } : {}),
         ...(activeChanges ? { active } : {}),
         ...(name !== undefined ? { name } : {}),
+        ...(viewTagChanges ? { viewTag: nextViewTag } : {}),
       },
     });
     if (active === false) await revokeSessions(db, { userId: user.id }, now());
@@ -164,13 +221,33 @@ export function usersRouter(deps: UsersDeps): Router {
     if (roleChanges) changes.role = [user.role, updated.role];
     if (activeChanges) changes.active = [user.active, updated.active];
     if (name !== undefined && name !== user.name) changes.name = [user.name, updated.name];
+    if (viewTagChanges) changes.viewTag = [user.viewTag, updated.viewTag];
     await record(req, "user.update", user.id, { changes });
-    if (roleChanges && updated.role === "ADMIN") await alert(req, "ADMIN_ROLE_GRANTED", user.id);
+    if (roleChanges && updated.role === "ADMIN" && user.role !== "SUPER_ADMIN")
+      await alert(req, "ADMIN_ROLE_GRANTED", user.id);
+    if (roleChanges && (updated.role === "SUPER_ADMIN" || user.role === "SUPER_ADMIN")) {
+      const grant = updated.role === "SUPER_ADMIN";
+      await record(req, grant ? "user.super_admin.grant" : "user.super_admin.revoke", user.id, {
+        via: "ui",
+        from: user.role,
+        to: updated.role,
+      });
+      await deps.notifier.notify?.({
+        kind: "security.ADMIN_ROLE_GRANTED",
+        title: grant ? "Super Admin granted" : "Super Admin removed",
+        body: grant
+          ? `${updated.email} is now a Super Admin (set by ${actor.email}): their risky actions are approved without a second Admin.`
+          : `${updated.email} is an Admin again (set by ${actor.email}).`,
+        severity: grant ? "critical" : "info",
+        meta: { subjectUserId: user.id, via: "ui" },
+        scope: user.id,
+      });
+    }
     res.json({ user: toUserSummary(updated, await sessionCount(user.id)) });
   });
 
   router.post("/:id/reset-2fa", async (req, res) => {
-    const user = await target(req, res);
+    const user = await targetToChange(req, res);
     if (!user) return;
     if (user.id === sessionOf(req).user.id) {
       fail(res, 409, "cannot_change_self");
@@ -195,7 +272,7 @@ export function usersRouter(deps: UsersDeps): Router {
   // Before first setup: a new invite link. After: a password reset link. Using a reset link
   // ends every session, and the account's 2FA is still required (agent decision A39).
   router.post("/:id/setup-link", async (req, res) => {
-    const user = await target(req, res);
+    const user = await targetToChange(req, res);
     if (!user) return;
     if (user.id === sessionOf(req).user.id) {
       fail(res, 409, "cannot_change_self");
@@ -212,7 +289,7 @@ export function usersRouter(deps: UsersDeps): Router {
   });
 
   router.post("/:id/sessions/:sessionId/revoke", async (req, res) => {
-    const user = await target(req, res);
+    const user = await targetToChange(req, res);
     if (!user) return;
     const sessionId = RecordId.safeParse(req.params.sessionId);
     if (!sessionId.success) {

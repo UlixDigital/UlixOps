@@ -24,6 +24,24 @@ const Env = z.object({
     .regex(/^\/[A-Za-z0-9._/-]{0,250}$/, "an absolute path")
     .refine((p) => !p.includes(".."), "an absolute path without ..")
     .default("/data/snapshots"),
+  /** Shared with the scanner sidecar (A138, A140). */
+  SCAN_WORK_DIR: z
+    .string()
+    .regex(/^\/[A-Za-z0-9._/-]{0,250}$/, "an absolute path")
+    .refine((p) => !p.includes(".."), "an absolute path without ..")
+    .default("/scan-work"),
+  /** Handshake with the Playwright sidecar (A163). */
+  VISUAL_WORK_DIR: z
+    .string()
+    .regex(/^\/[A-Za-z0-9._/-]{0,250}$/, "an absolute path")
+    .refine((p) => !p.includes(".."), "an absolute path without ..")
+    .default("/visual-work"),
+  /** PNG store shared with the API for authenticated image GETs (A163). */
+  VISUAL_STORE_DIR: z
+    .string()
+    .regex(/^\/[A-Za-z0-9._/-]{0,250}$/, "an absolute path")
+    .refine((p) => !p.includes(".."), "an absolute path without ..")
+    .default("/data/visual"),
   /** AES-256 key for snapshot blobs; only the runner holds it (agent decision A69). */
   SNAPSHOT_ENCRYPTION_KEY: z.string().regex(/^[0-9a-fA-F]{64}$/, "64 hex characters (32 bytes)"),
   /** Registry plugin ZIPs, read-only (A63 / A81). Shared volume with the API. */

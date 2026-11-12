@@ -12,11 +12,14 @@ export const MIN_HEALTH_THRESHOLD_MS = 500;
 export const MAX_HEALTH_THRESHOLD_MS = 30_000;
 export const MAX_HEALTH_EXTRA_PATHS = 20;
 
-/** Always checked in addition to any configured extra paths (agent decision A77). */
-export const BUILTIN_HEALTH_PATHS = ["/", "/wp-admin/"] as const;
+/** Always checked, before any configured extra paths (agent decisions A77, A151). */
+export const BUILTIN_HEALTH_PATHS = ["/"] as const;
+/** Checked only when `checkWpAdmin` is on: login pages are often behind bot protection that
+ * blocks servers, so it is off by default (A151). */
+export const WP_ADMIN_HEALTH_PATH = "/wp-admin/";
 
 export const HealthCheckSettings = z.object({
-  /** Extra paths beyond homepage and wp-admin (each starts with /). */
+  /** Extra paths beyond the homepage (each starts with /). */
   extraPaths: z.array(HealthPath).max(MAX_HEALTH_EXTRA_PATHS).default([]),
   /** Fail a URL when the final response takes longer than this. */
   thresholdMs: z
@@ -27,6 +30,8 @@ export const HealthCheckSettings = z.object({
     .default(DEFAULT_HEALTH_THRESHOLD_MS),
   /** Try to read wp-content/debug.log over SFTP when the host key is pinned. */
   checkErrorLog: z.boolean().default(true),
+  /** Also load /wp-admin/ (A151). Off by default. */
+  checkWpAdmin: z.boolean().default(false),
 });
 export type HealthCheckSettings = z.infer<typeof HealthCheckSettings>;
 
@@ -105,9 +110,16 @@ export function healthFetchOrigin(siteUrl: string, sshHost: string): string {
  * Build absolute check URLs from an environment origin and configured extra paths.
  * Homepage and wp-admin are always included (deduped).
  */
-export function buildHealthUrls(origin: string, extraPaths: readonly string[]): string[] {
+export function buildHealthUrls(
+  origin: string,
+  settings: { extraPaths: readonly string[]; checkWpAdmin: boolean },
+): string[] {
   const base = new URL(origin);
-  const paths = [...BUILTIN_HEALTH_PATHS, ...extraPaths];
+  const paths = [
+    ...BUILTIN_HEALTH_PATHS,
+    ...(settings.checkWpAdmin ? [WP_ADMIN_HEALTH_PATH] : []),
+    ...settings.extraPaths,
+  ];
   const seen = new Set<string>();
   const urls: string[] = [];
   for (const path of paths) {

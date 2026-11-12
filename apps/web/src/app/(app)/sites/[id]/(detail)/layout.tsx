@@ -1,6 +1,6 @@
 // Spec screen 5: the site header and tabs shared by Overview, Plugins & themes, Emergency and
-// Logs. Snapshots, deployments and later-phase tabs show as "soon".
-import { can } from "@ulixops/shared";
+// Logs. Later-phase tabs (DNS, visual checks) show as "soon".
+import { can, isClientViewer } from "@ulixops/shared";
 import Link from "next/link";
 import type { ReactNode } from "react";
 import { ActionForm } from "@/components/action-form";
@@ -10,6 +10,7 @@ import { requireSession } from "@/lib/auth";
 import { loadSite } from "@/lib/site";
 import { HOST_LABELS } from "@/lib/site-status";
 import { setArchivedAction } from "../../actions";
+import { SiteActivity } from "./site-activity";
 import { SiteTabs } from "./site-tabs";
 
 export default async function SiteLayout({
@@ -22,9 +23,10 @@ export default async function SiteLayout({
   const { user } = await requireSession();
   const site = await loadSite((await params).id);
   const manage = can(user.role, "sites.manage");
+  const clientViewer = isClientViewer(user.role);
 
   return (
-    <div className="grid gap-4">
+    <div className="grid min-w-0 gap-4">
       <Link href="/sites" className="text-sm text-muted-foreground hover:text-foreground">
         ← Sites
       </Link>
@@ -92,7 +94,8 @@ export default async function SiteLayout({
         </Notice>
       )}
 
-      <SiteTabs siteId={site.id} />
+      {!clientViewer && <SiteActivity siteId={site.id} />}
+      <SiteTabs siteId={site.id} clientViewer={clientViewer} />
       {children}
     </div>
   );

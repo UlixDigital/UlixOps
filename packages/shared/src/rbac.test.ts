@@ -10,25 +10,30 @@ import {
 
 // Written out in full on purpose: any change to who may do what must change this table too.
 const EXPECTED: Record<Permission, RoleName[]> = {
-  "dashboard.view": ["ADMIN", "DEVELOPER", "VIEWER"],
-  "sites.view": ["ADMIN", "DEVELOPER", "VIEWER"],
-  "plugins.view": ["ADMIN", "DEVELOPER", "VIEWER"],
-  "deployments.view": ["ADMIN", "DEVELOPER", "VIEWER"],
-  "notifications.view": ["ADMIN", "DEVELOPER", "VIEWER"],
-  "plugins.upload": ["ADMIN", "DEVELOPER"],
-  "deploy.staging": ["ADMIN", "DEVELOPER"],
-  "deploy.single": ["ADMIN", "DEVELOPER"],
-  "deploy.bulk.request": ["ADMIN", "DEVELOPER"],
-  "sites.refresh": ["ADMIN", "DEVELOPER"],
-  "site.emergency": ["ADMIN", "DEVELOPER"],
-  "sites.manage": ["ADMIN"],
-  "secrets.manage": ["ADMIN"],
-  "users.manage": ["ADMIN"],
-  "settings.manage": ["ADMIN"],
-  "approvals.decide": ["ADMIN"],
-  "audit.view": ["ADMIN"],
+  "dashboard.view": ["SUPER_ADMIN", "ADMIN", "DEVELOPER", "VIEWER", "CLIENT_VIEWER"],
+  "sites.view": ["SUPER_ADMIN", "ADMIN", "DEVELOPER", "VIEWER", "CLIENT_VIEWER"],
+  "plugins.view": ["SUPER_ADMIN", "ADMIN", "DEVELOPER", "VIEWER"],
+  "deployments.view": ["SUPER_ADMIN", "ADMIN", "DEVELOPER", "VIEWER"],
+  "notifications.view": ["SUPER_ADMIN", "ADMIN", "DEVELOPER", "VIEWER"],
+  "plugins.upload": ["SUPER_ADMIN", "ADMIN", "DEVELOPER"],
+  "deploy.staging": ["SUPER_ADMIN", "ADMIN", "DEVELOPER"],
+  "deploy.single": ["SUPER_ADMIN", "ADMIN", "DEVELOPER"],
+  "deploy.bulk.request": ["SUPER_ADMIN", "ADMIN", "DEVELOPER"],
+  "sites.refresh": ["SUPER_ADMIN", "ADMIN", "DEVELOPER"],
+  "site.emergency": ["SUPER_ADMIN", "ADMIN", "DEVELOPER"],
+  "sites.manage": ["SUPER_ADMIN", "ADMIN"],
+  "secrets.manage": ["SUPER_ADMIN", "ADMIN"],
+  "users.manage": ["SUPER_ADMIN", "ADMIN"],
+  "settings.manage": ["SUPER_ADMIN", "ADMIN"],
+  "vulns.sync": ["SUPER_ADMIN", "ADMIN"],
+  "backups.restore": ["SUPER_ADMIN", "ADMIN"],
+  "dns.manage": ["SUPER_ADMIN", "ADMIN"],
+  "approvals.self": ["SUPER_ADMIN"],
+  "alerts.track": ["SUPER_ADMIN"],
+  "approvals.decide": ["SUPER_ADMIN", "ADMIN"],
+  "audit.view": ["SUPER_ADMIN", "ADMIN"],
 };
-const ROLES: RoleName[] = ["ADMIN", "DEVELOPER", "VIEWER"];
+const ROLES: RoleName[] = ["SUPER_ADMIN", "ADMIN", "DEVELOPER", "VIEWER", "CLIENT_VIEWER"];
 
 describe("role permissions", () => {
   it("covers every permission in the expectation table", () => {
@@ -57,6 +62,9 @@ describe("single-site actions", () => {
       "plugin.activate",
       "plugin.update",
       "theme.update",
+      "core.update",
+      "plugin.delete",
+      "theme.delete",
       "snapshot.create",
     ] as const) {
       expect(siteActionPermission(action, "PRODUCTION")).toBe("deploy.single");
@@ -82,6 +90,9 @@ describe("single-site actions", () => {
       "plugin.activate",
       "plugin.update",
       "theme.update",
+      "core.update",
+      "plugin.delete",
+      "theme.delete",
       "snapshot.create",
       "snapshot.restore",
       "plugin.deactivate",
@@ -101,6 +112,14 @@ describe("approval decisions", () => {
 
   it("lets another Admin decide a pending request", () => {
     expect(canDecideApproval(pending, { id: "admin-1", role: "ADMIN" })).toEqual({ ok: true });
+  });
+
+  it("lets only a Super Admin approve their own request, and only while pending (A134)", () => {
+    const own = { requestedById: "super-1", status: "PENDING" };
+    expect(canDecideApproval(own, { id: "super-1", role: "SUPER_ADMIN" })).toEqual({ ok: true });
+    expect(
+      canDecideApproval({ ...own, status: "APPROVED" }, { id: "super-1", role: "SUPER_ADMIN" }),
+    ).toEqual({ ok: false, reason: "already_decided" });
   });
 
   it("never lets the requester approve their own request, even an Admin", () => {

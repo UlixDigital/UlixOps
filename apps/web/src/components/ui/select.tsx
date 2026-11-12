@@ -14,12 +14,19 @@ export function Select({ className, ...props }: ComponentProps<"select">) {
   );
 }
 
-export function RoleOptions() {
+/** Invite / Admin role picker. Pass `includeSuperAdmin` only for Super Admins changing roles (A172). */
+export function RoleOptions({ includeSuperAdmin = false }: { includeSuperAdmin?: boolean } = {}) {
   return (
     <>
-      <option value="VIEWER">Viewer: read-only</option>
+      <option value="VIEWER">Viewer: read-only (all sites)</option>
+      <option value="CLIENT_VIEWER">Client Viewer: read-only for one site tag</option>
       <option value="DEVELOPER">Developer: deploys to staging and single sites</option>
       <option value="ADMIN">Admin: full access</option>
+      {includeSuperAdmin && (
+        <option value="SUPER_ADMIN">
+          Super Admin: self-approves risky actions (Admin with 2FA only)
+        </option>
+      )}
     </>
   );
 }

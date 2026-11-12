@@ -1,8 +1,9 @@
 // Contracts for user management (Admins), My account and settings.
 import { z } from "zod";
-import { Role } from "./auth";
+import { AssignableRole, Role, SuperAssignableRole } from "./auth";
 import { NotificationPrefs } from "./notifications";
 import { PasskeyView } from "./passkeys";
+import { SiteTag } from "./sites";
 
 const id = z.string().regex(/^[a-z0-9]{1,64}$/);
 const iso = z.iso.datetime();
@@ -24,6 +25,8 @@ export const UserSummary = z.object({
   email: z.string(),
   name: z.string().nullable(),
   role: Role,
+  /** Site tag for CLIENT_VIEWER; null for other roles (A178). */
+  viewTag: z.string().nullable(),
   active: z.boolean(),
   twoFactorEnabled: z.boolean(),
   /** Invited, but the setup link has not been used yet. */
@@ -40,24 +43,68 @@ export type UserDetail = z.infer<typeof UserDetail>;
 
 const name = z.string().trim().max(100);
 
-export const InviteUserRequest = z.object({
-  email: z.string().trim().toLowerCase().max(254).pipe(z.email()),
-  name: name.optional(),
-  role: Role,
-});
+export const InviteUserRequest = z
+  .object({
+    email: z.string().trim().toLowerCase().max(254).pipe(z.email()),
+    name: name.optional(),
+    role: AssignableRole,
+    /** Required when role is CLIENT_VIEWER (A178). */
+    viewTag: SiteTag.optional(),
+  })
+  .superRefine((body, ctx) => {
+    if (body.role === "CLIENT_VIEWER" && !body.viewTag) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["viewTag"],
+        message: "Client Viewer needs a site tag",
+      });
+    }
+    if (body.role !== "CLIENT_VIEWER" && body.viewTag) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["viewTag"],
+        message: "Only Client Viewer uses a site tag",
+      });
+    }
+  });
 export const SetupLinkResponse = z.object({ setupLink: z.url(), expiresAt: iso });
 export const InviteUserResponse = SetupLinkResponse.extend({ user: UserSummary });
 
 export const UpdateUserRequest = z
   .object({
-    role: Role.optional(),
+    /** Super Admin may set SUPER_ADMIN; regular Admins are limited in the route (A172). */
+    role: SuperAssignableRole.optional(),
     active: z.boolean().optional(),
     name: name.nullable().optional(),
+    /** Set/clear with role; required when role becomes CLIENT_VIEWER (A178). */
+    viewTag: SiteTag.nullable().optional(),
   })
-  .refine((body) => Object.keys(body).length > 0, "Nothing to change");
+  .refine((body) => Object.keys(body).length > 0, "Nothing to change")
+  .superRefine((body, ctx) => {
+    if (body.role === "CLIENT_VIEWER" && (body.viewTag === null || body.viewTag === undefined)) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["viewTag"],
+        message: "Client Viewer needs a site tag",
+      });
+    }
+    if (body.role !== undefined && body.role !== "CLIENT_VIEWER" && body.viewTag) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["viewTag"],
+        message: "Only Client Viewer uses a site tag",
+      });
+    }
+  });
 
 export const AccountInfo = z.object({
-  user: z.object({ id, email: z.string(), name: z.string().nullable(), role: Role }),
+  user: z.object({
+    id,
+    email: z.string(),
+    name: z.string().nullable(),
+    role: Role,
+    viewTag: z.string().nullable(),
+  }),
   twoFactorEnabled: z.boolean(),
   sessions: z.array(SessionSummary),
   passkeys: z.array(PasskeyView),
@@ -104,6 +151,7 @@ export const SettingsView = z.object({
     extraPaths: z.array(z.string()),
     thresholdMs: z.number().int(),
     checkErrorLog: z.boolean(),
+    checkWpAdmin: z.boolean(),
   }),
   /** Which events go to email / Slack (spec §6.8 / screen 19); in-app is always on. */
   notificationPrefs: NotificationPrefs,

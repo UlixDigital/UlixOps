@@ -34,12 +34,13 @@ export async function resetData(url: string): Promise<void> {
 export async function userWithSession(
   db: Db,
   role: RoleName,
-  opts: { sessionSecret: string; now: Date; email?: string },
+  opts: { sessionSecret: string; now: Date; email?: string; viewTag?: string | null },
 ) {
   const user = await db.user.create({
     data: {
       email: opts.email ?? `${role.toLowerCase()}@example.test`,
       role,
+      viewTag: opts.viewTag ?? null,
       passwordHash: "argon2id$unused-in-these-tests",
       twoFactorEnabled: true,
     },
